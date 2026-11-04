@@ -413,12 +413,88 @@ fk_script(void *arg, wait_result_t wr)
  * and finger 0 must not be in use by a real contact.
  */
 extern void sweet_hid_touch(int finger, int down, int x, int y);
+extern void sweet_hid_touch_sub(int finger, int down, int x, int y);   /* 1/16 px (SWEET_TOUCH_SUB) */
 extern int sweet_fb_display_off;       /* iokit/Kernel/arm/SweetFramebuffer.cpp */
 static unsigned fk_touch_loops = 10;
+
+/*
+ * fuxiflickus=N (2000..20000, default off): the scripted strokes (fk_swipe, fk_flick, fk_switcher, so
+ * boot/phone.py's flicks, fuxitouchscript and fuxihuman) put a point down every N us on an absolute clock with no
+ * timer leeway, in 1/16 px, instead of an 8 ms sleep after each point in whole pixels. The old way (kept
+ * without the argument, so older runs stay comparable) gave about 8.5 ms a point (estimated from h-lf1 and
+ * h-lf2): each 8 ms sleep is a
+ * relative deadline that the kernel may defer by up to 1 ms (timer_compute_leeway, kernel threads: 8 ms >> 3),
+ * slower than CoreAnimation's 8.33 ms frame and the panel's 8.27 ms TE, and the end of an eased stroke repeats
+ * whole pixels, which SweetHID drops. Both leave frames with nothing new to draw
+ * (research_notes/cam-ung-vsync.md). The dense hand-pace flicks added later (0117) keep their own loop.
+ */
+static unsigned fk_step_cached = ~0u;
+
+static unsigned
+fk_step_us(void)
+{
+	if (fk_step_cached == ~0u) {
+		unsigned us = 0;
+		(void)PE_parse_boot_argn("fuxiflickus", &us, sizeof(us));
+		fk_step_cached = us >= 2000u && us <= 20000u ? us : 0u;
+		if (fk_step_cached) {
+			printf("FUXI KEYS: scripted touch points every %u us on an absolute clock, 1/16 px (fuxiflickus)\n", us);
+		}
+	}
+	return fk_step_cached;
+}
+
+/*
+ * Called after each point: sleep until the next one's absolute deadline, with no leeway. A point that went out more
+ * than half a step late (the thread was held up) moves the clock: the next comes one step after it, not at once.
+ */
+static void
+fk_step_wait(uint64_t *deadline, uint64_t step)
+{
+	uint64_t now = mach_absolute_time();
+	if (now + step / 2 > *deadline) {
+		*deadline = now + step;
+	}
+	(void)assert_wait_deadline_with_leeway(&fk_script_chan, THREAD_UNINT, TIMEOUT_URGENCY_SYS_CRITICAL, *deadline, 0);
+	thread_block(THREAD_CONTINUE_NULL);
+	*deadline += step;
+}
+
+/*
+ * One stroke at fuxiflickus's pace, the finger down from (x0, y0) to (x1, y1) over ms, linear or eased out as
+ * fk_flick's (fast at first, slowing to the release), then held still for hold_ms, then lifted if lift.
+ */
+static void
+fk_stroke_fine(int x0, int y0, int x1, int y1, unsigned ms, bool ease, unsigned hold_ms, bool lift)
+{
+	unsigned us = fk_step_us();
+	int64_t steps = (int64_t)ms * 1000 / us, holds = (int64_t)hold_ms * 1000 / us;
+	uint64_t step, deadline;
+	if (steps < 1) {
+		steps = 1;
+	}
+	nanoseconds_to_absolutetime((uint64_t)us * 1000u, &step);
+	deadline = mach_absolute_time() + step;
+	int64_t dx = (int64_t)(x1 - x0) * 16, dy = (int64_t)(y1 - y0) * 16;
+	for (int64_t i = 0; i <= steps + holds; ++i) {
+		int64_t k = i < steps ? i : steps, left = steps - k;
+		int64_t num = ease ? steps * steps - left * left : k, den = ease ? steps * steps : steps;
+		fuxi_perf_input();
+		sweet_hid_touch_sub(0, 1, x0 * 16 + (int)(dx * num / den), y0 * 16 + (int)(dy * num / den));
+		fk_step_wait(&deadline, step);
+	}
+	if (lift) {
+		sweet_hid_touch_sub(0, 0, x1 * 16, y1 * 16);
+	}
+}
 
 static void
 fk_swipe(int x0, int y0, int x1, int y1, unsigned ms)
 {
+	if (fk_step_us()) {
+		fk_stroke_fine(x0, y0, x1, y1, ms, false, 0, true);
+		return;
+	}
 	unsigned steps = ms / 8u ? ms / 8u : 1u;
 	for (unsigned i = 0; i <= steps; ++i) {
 		int x = x0 + (x1 - x0) * (int)i / (int)steps;
@@ -591,6 +667,10 @@ static bool fk_human_shots;
 static void
 fk_flick(int x0, int y0, int x1, int y1, unsigned ms)
 {
+	if (fk_step_us()) {
+		fk_stroke_fine(x0, y0, x1, y1, ms, true, 0, true);
+		return;
+	}
 	int steps = (int)(ms / 8u ? ms / 8u : 1u);
 	for (int i = 0; i <= steps; ++i) {
 		/* Ease out: fast at first, slowing to the release. */
@@ -611,6 +691,12 @@ fk_flick(int x0, int y0, int x1, int y1, unsigned ms)
 static void
 fk_switcher(unsigned hold_ms)
 {
+	if (fk_step_us()) {
+		/* The same stroke (34 eased 8 ms points, 680,2375 -> 740,1945), the hold, then the lift. */
+		fk_stroke_fine(680, 2375, 740, 1945, 34 * 8, true, hold_ms, true);
+		fk_script_sleep(1500);
+		return;
+	}
 	for (int i = 0; i <= 34; ++i) {
 		int left = 34 - i, done = 34 * 34 - left * left;
 		fuxi_perf_input();

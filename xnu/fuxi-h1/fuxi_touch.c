@@ -38,6 +38,27 @@
  * 75efe1c, e43c254, 22f2dd4 and ba03e5d (BSD-2-Clause-Patent).
  * Notice: iokit/Kernel/arm/hid/LICENSE.NativeHidInput. fuxitbatch=1
  * sends the complete ID-indexed contact set in one digitizer collection.
+ *
+ * Report rate (research_notes/cam-ung-vsync.md). By default the FTS scans
+ * on its own clock, about every 8.2 ms (contact lines: 8177-8305 us apart),
+ * free-running against the panel's 8.27 ms TE. Two opt-in boot-args, both
+ * off by default:
+ *  - fuxitouchfine=1 (software only): positions go to HID in the FTS's own
+ *    0.1 px instead of whole pixels, so a slow finger still moves every
+ *    report (a repeated position is no HID event, and no frame).
+ *  - fuxitouchrate=1 (writes to the IC): after sensing is on, and again
+ *    after a controller reset, send {0xC0, 0x20, 0x01}, byte for byte the
+ *    command of LineageOS's fts_set_report_rate(info, 1) (kernel
+ *    android_kernel_xiaomi_sm8550 f9ca2b71, drivers/input/touchscreen/
+ *    fts_spi/fts.c; written by vendor.lineage.touch "high touch polling
+ *    rate" through bump_sample_rate), 12 ms after the scan mode as
+ *    fts_resume_work waits. Xiaomi gives 120 Hz normally and 240 Hz in game
+ *    mode for this phone; what the command gives here is read from the
+ *    contact lines' "us apart". Nothing else is ever written for it, and it
+ *    is not undone (the IC's own reset clears it).
+ * Status and error events in the FIFO (0x43, 0xf3; ftsSoftware.h), such as
+ * the IC's echo of a command (43 01 <command>), are logged, the first
+ * FT_NOTE_MAX of a boot; before, they were dropped unread.
  */
 #if defined(FUXI)
 #include <sys/param.h>
@@ -58,6 +79,9 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern kern_return_t thread_terminate(thread_t);
 extern void sweet_hid_touch(int finger, int down, int x, int y);
 extern int sweet_hid_touch_report(uint32_t mask, const int *x, const int *y);
+/* The same in 1/FT_SUB panel pixel (SweetHID.cpp SWEET_TOUCH_SUB). */
+extern void sweet_hid_touch_sub(int finger, int down, int x, int y);
+extern int sweet_hid_touch_report_sub(uint32_t mask, const int *x, const int *y);
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation,
     void *parameter, integer_t priority, thread_t *new_thread);
@@ -83,6 +107,10 @@ void fuxi_touch_init(void);
 #define FT_EV_MOTION 0x23u
 #define FT_EV_LEAVE  0x33u
 #define FT_TYPE_HOVER 0x05u        /* ftsSoftware.h TOUCH_TYPE_HOVER: not touching */
+#define FT_EV_STATUS 0x43u         /* ftsSoftware.h EVT_ID_STATUS_UPDATE (type 0x01: echo of a command) */
+#define FT_EV_ERROR  0xf3u         /* ftsSoftware.h EVT_ID_ERROR */
+#define FT_NOTE_MAX  8u            /* status/error events logged per boot */
+#define FT_SUB       16            /* SweetHID SWEET_TOUCH_SUB: units per panel pixel */
 #define FT_PRIORITY  92            /* BASEPRI_PREEMPT */
 
 static struct {
@@ -92,9 +120,13 @@ static struct {
 	unsigned depth, level, wp[2], evrp;
 	bool started;
 	unsigned batch;              /* opt-in report-wide HID collection */
+	unsigned fine;               /* fuxitouchfine=1: xs/ys (1/FT_SUB px) to HID */
+	unsigned rate;               /* fuxitouchrate=1: the report rate command */
+	unsigned notes;              /* status/error FIFO events seen */
 	bool retry;                  /* latest set not yet constructed by HID */
 	uint32_t active;
 	int x[FT_MAX], y[FT_MAX];
+	int xs[FT_MAX], ys[FT_MAX];  /* the same in 1/FT_SUB px, from the FTS's 0.1 px */
 	bool ic_reset;                 /* controller-ready event while sensing */
 	unsigned fifo_hits;            /* FIFO reads that found an event (interrupt checks) */
 	/* Per-contact statistics (first finger down -> last finger up). */
@@ -516,18 +548,22 @@ ft_report(uint32_t mask)
 		uint32_t bit = 1u << id;
 		if (mask & bit) {
 			down_count++;
-			if (!ft.batch) {
+			if (!ft.batch && ft.fine) {
+				sweet_hid_touch_sub((int)id, 1, ft.xs[id], ft.ys[id]);
+			} else if (!ft.batch) {
 				sweet_hid_touch((int)id, 1, ft.x[id], ft.y[id]);
 			}
 		} else if (ft.active & bit) {
 			ft.c_lifts++;
-			if (!ft.batch) {
+			if (!ft.batch && ft.fine) {
+				sweet_hid_touch_sub((int)id, 0, ft.xs[id], ft.ys[id]);
+			} else if (!ft.batch) {
 				sweet_hid_touch((int)id, 0, ft.x[id], ft.y[id]);
 			}
 		}
 	}
 	if (ft.batch && (mask || ft.active)) {
-		ft.retry = !sweet_hid_touch_report(mask, ft.x, ft.y);
+		ft.retry = !(ft.fine ? sweet_hid_touch_report_sub(mask, ft.xs, ft.ys) : sweet_hid_touch_report(mask, ft.x, ft.y));
 	}
 	ft.c_multi += down_count >= 2;
 	ft.c_max = down_count > ft.c_max ? down_count : ft.c_max;
@@ -547,7 +583,8 @@ static void
 ft_retry_report(void)
 {
 	if (ft.retry) {
-		ft.retry = !sweet_hid_touch_report(ft.active, ft.x, ft.y);
+		ft.retry = !(ft.fine ? sweet_hid_touch_report_sub(ft.active, ft.xs, ft.ys) :
+		    sweet_hid_touch_report(ft.active, ft.x, ft.y));
 	}
 }
 
@@ -588,6 +625,15 @@ ft_poll(bool deliver)
 			ft.ic_reset = true;
 			continue;
 		}
+		if (ev[0] == FT_EV_STATUS || ev[0] == FT_EV_ERROR) {
+			/* Echo of a command (43 01 <its first bytes>) or an error: read-only, a few per boot. */
+			if (++ft.notes <= FT_NOTE_MAX) {
+				printf("FUXI TOUCH: %s event %02x %02x %02x %02x %02x %02x %02x %02x (%u of the first %u logged)\n",
+				    ev[0] == FT_EV_STATUS ? "status" : "error", ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7],
+				    ft.notes, FT_NOTE_MAX);
+			}
+			continue;
+		}
 		unsigned id = ev[1] >> 4, type = ev[1] & 0xf;
 		if ((ev[0] != FT_EV_ENTER && ev[0] != FT_EV_MOTION && ev[0] != FT_EV_LEAVE) ||
 		    id >= FT_MAX || (type == 0 && ev[0] != FT_EV_LEAVE)) {
@@ -603,9 +649,13 @@ ft_poll(bool deliver)
 			}
 		}
 		/* Super-resolution coordinates, 10x the 1080x2400 panel. */
-		int x = ((ev[3] << 8) | ev[2]) / 10, y = ((ev[5] << 8) | ev[4]) / 10;
+		int rx = (ev[3] << 8) | ev[2], ry = (ev[5] << 8) | ev[4];
+		int x = rx / 10, y = ry / 10;
 		ft.x[id] = x > 1079 ? 1079 : x;
 		ft.y[id] = y > 2399 ? 2399 : y;
+		/* The same in 1/FT_SUB px (fuxitouchfine=1), clamped at the last whole pixel as SweetHID does. */
+		ft.xs[id] = rx * FT_SUB / 10 > 1079 * FT_SUB ? 1079 * FT_SUB : rx * FT_SUB / 10;
+		ft.ys[id] = ry * FT_SUB / 10 > 2399 * FT_SUB ? 2399 * FT_SUB : ry * FT_SUB / 10;
 		if (ev[0] == FT_EV_LEAVE || type == FT_TYPE_HOVER) {
 			mask &= ~(1u << id);
 		} else {
@@ -922,6 +972,24 @@ ft_irq_wait(uint32_t seen, uint64_t deadline, uint64_t leeway)
 	(void)thread_block(THREAD_CONTINUE_NULL);
 }
 
+/*
+ * fuxitouchrate=1 only: the report rate command, byte for byte LineageOS's fts_set_report_rate(info, 1)
+ * ({0xC0, 0x20, rate}, written with fts_write_dma_safe as setScanMode writes {0xA0, ...}: our ft_tx). Sent
+ * only while sensing is on, 12 ms after the scan mode command (fts_resume_work: fts_mode_handler, msleep(12),
+ * then the rate).
+ */
+static void
+ft_rate_on(const char *why)
+{
+	static const uint8_t rate_cmd[] = {0xc0, 0x20, 0x01};
+	if (ft.rate != 1) {
+		return;
+	}
+	ft_sleep(12);
+	int err = ft_tx(rate_cmd, (unsigned)sizeof(rate_cmd), false);
+	printf("FUXI TOUCH: report rate command c0 20 01 (fuxitouchrate=1, %s) -> %d\n", why, err);
+}
+
 static void
 ft_thread(void *arg, wait_result_t result)
 {
@@ -939,6 +1007,9 @@ ft_thread(void *arg, wait_result_t result)
 	(void)PE_parse_boot_argn("fuxitouch_idle_us", &idle_us, sizeof(idle_us));
 	(void)PE_parse_boot_argn("fuxitouch_offsuppress", &offsup, sizeof(offsup));
 	(void)PE_parse_boot_argn("fuxitbatch", &ft.batch, sizeof(ft.batch));
+	(void)PE_parse_boot_argn("fuxitouchfine", &ft.fine, sizeof(ft.fine));
+	(void)PE_parse_boot_argn("fuxitouchrate", &ft.rate, sizeof(ft.rate));
+	ft.fine = ft.fine == 1;
 	poll_us = poll_us < 1000 ? 1000 : poll_us;
 	idle_us = idle_us < poll_us ? poll_us : idle_us;
 	printf("FUXI TOUCH: starting in %u s (poll %u us active, %u us idle)\n", delay_s,
@@ -946,6 +1017,9 @@ ft_thread(void *arg, wait_result_t result)
 	if (ft.batch) {
 		printf("FUXI TOUCH: report collections enabled (fuxitbatch=1)\n");
 	}
+	printf("FUXI TOUCH: positions to HID in %s (fuxitouchfine=%u); report rate command %s (fuxitouchrate=%u)\n",
+	    ft.fine ? "1/16 px from the IC's 0.1 px" : "whole pixels", ft.fine,
+	    ft.rate == 1 ? "c0 20 01 after sensing on" : "not sent", ft.rate);
 	ft_sleep(delay_s * 1000u);
 	ft.gcc = ml_io_map(FT_GCC_PA, 0x1f0000);
 	ft.tlmm = ml_io_map(FT_TLMM_PA, 0x30000);
@@ -997,6 +1071,7 @@ ft_thread(void *arg, wait_result_t result)
 		printf("FUXI TOUCH: sense on failed %d\n", err);
 		goto out;
 	}
+	ft_rate_on("sensing on");
 	bool irqmode = want_irq && ft_irq_setup();
 	if (!want_irq) {
 		printf("FUXI TOUCH IRQ: off (fuxitouch_irq=0)\n");
@@ -1161,6 +1236,9 @@ ft_thread(void *arg, wait_result_t result)
 				fuxi_wake_touch_reset(&ft.wake);
 				int serr = ft_tx(sense, 3, false);
 				printf("FUXI TOUCH: controller reset event, sense on again -> %d\n", serr);
+				if (!serr) {
+					ft_rate_on("after a controller reset");
+				}
 			}
 		}
 		ft_retry_report();

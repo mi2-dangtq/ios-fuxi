@@ -387,6 +387,15 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
 #define SWEET_FIT_W 1080
 #define SWEET_FIT_H 2338
 #define SWEET_FIT_Y 31
+/*
+ * touch() and report() take panel coordinates in 1/SWEET_TOUCH_SUB pixel. sweet_hid_touch() and
+ * sweet_hid_touch_report() take whole pixels and scale them, so their events are the same as before to the
+ * bit; the _sub entries carry the FTS's 0.1 px (fuxitouchfine=1) and the scripted touches' 1/16 px
+ * (fuxiflickus). Whole-pixel input slower than one pixel per report repeats a position, and a repeated
+ * position is no event at all: a slow drag then leaves frames with nothing new to draw
+ * (research_notes/cam-ung-vsync.md). Clamps stay at the last whole pixel, as before.
+ */
+#define SWEET_TOUCH_SUB 16
 extern "C" int sweet_fb_fit; /* 0 crop, 1 scaled with bars, 2 stretched */
 class SweetHIDTouch : public IOHIDEventService {
 	OSDeclareDefaultStructors(SweetHIDTouch);
@@ -402,6 +411,8 @@ protected:
 private:
 	IOLock *fLock;
 	OSSet *fSeenKeys;	/* property names backboardd has set, logged once each */
+	UInt64 fReportInterval, fBatchInterval;	/* last values set, logged again when they change */
+	UInt32 fRateLogs;
 	int fLogicalW, fLogicalH, fOffX, fOffY;
 	bool fDown[SWEET_TOUCH_FINGERS];
 	bool fEdge[SWEET_TOUCH_FINGERS];
@@ -481,6 +492,7 @@ SweetHIDTouch::start(IOService *provider)
 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
 	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
 	fSeenKeys = OSSet::withCapacity(SWEET_TOUCH_SEEN_KEYS);
+	fReportInterval = fBatchInterval = ~0ULL;
 	gSweetTouch = this;
 	registerService();
 	IOLog("SWEET HID: touch registered\n");
@@ -490,8 +502,33 @@ SweetHIDTouch::start(IOService *provider)
 /*
  * The event system pushes its settings here. TouchDetectionMode is kept for
  * tap-to-wake; every other property is accepted and ignored as before. The
- * first SWEET_TOUCH_SEEN_KEYS distinct names are logged once each.
+ * first SWEET_TOUCH_SEEN_KEYS distinct names are logged once each, with the
+ * value (a number, a boolean, a string or the object's class). ReportInterval
+ * and BatchInterval (us) are logged again whenever backboardd changes them, at
+ * most SWEET_TOUCH_RATE_LOGS times: nothing here acts on them, and the touch
+ * controller keeps its own rate.
  */
+#define SWEET_TOUCH_RATE_LOGS 16
+static void
+sweet_touch_property_log(const char *name, OSObject *value, const char *why)
+{
+	OSNumber *number = OSDynamicCast(OSNumber, value);
+	OSBoolean *boolean = OSDynamicCast(OSBoolean, value);
+	OSString *string = OSDynamicCast(OSString, value);
+
+	if (number) {
+		IOLog("SWEET HID: touch property \"%s\" = %llu (%#llx) %s\n", name, number->unsigned64BitValue(),
+		    number->unsigned64BitValue(), why);
+	} else if (boolean) {
+		IOLog("SWEET HID: touch property \"%s\" = %s %s\n", name, boolean->isTrue() ? "true" : "false", why);
+	} else if (string) {
+		IOLog("SWEET HID: touch property \"%s\" = \"%s\" %s\n", name, string->getCStringNoCopy(), why);
+	} else {
+		IOLog("SWEET HID: touch property \"%s\" = (%s) %s\n", name,
+		    value ? value->getMetaClass()->getClassName() : "null", why);
+	}
+}
+
 IOReturn
 SweetHIDTouch::setProperties(OSObject *properties)
 {
@@ -514,9 +551,21 @@ SweetHIDTouch::setProperties(OSObject *properties)
 		OSString *name;
 		IOLockLock(fLock);
 		while ((name = OSDynamicCast(OSString, it->getNextObject()))) {
-			if (fSeenKeys->getCount() < SWEET_TOUCH_SEEN_KEYS && !fSeenKeys->containsObject(name)) {
+			OSObject *value = dict->getObject(name);
+			OSNumber *number = OSDynamicCast(OSNumber, value);
+			UInt64 *last = !number ? NULL : name->isEqualTo("ReportInterval") ? &fReportInterval :
+			    name->isEqualTo("BatchInterval") ? &fBatchInterval : NULL;
+			bool first = fSeenKeys->getCount() < SWEET_TOUCH_SEEN_KEYS && !fSeenKeys->containsObject(name);
+			bool changed = last && *last != ~0ULL && *last != number->unsigned64BitValue();
+			if (first) {
 				fSeenKeys->setObject(name);
-				IOLog("SWEET HID: touch property \"%s\" set by the event system\n", name->getCStringNoCopy());
+				sweet_touch_property_log(name->getCStringNoCopy(), value, "set by the event system");
+			} else if (changed && fRateLogs < SWEET_TOUCH_RATE_LOGS) {
+				fRateLogs++;
+				sweet_touch_property_log(name->getCStringNoCopy(), value, "changed by the event system");
+			}
+			if (last) {
+				*last = number->unsigned64BitValue();
 			}
 		}
 		IOLockUnlock(fLock);
@@ -532,28 +581,32 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
 	IOHIDEvent *collection;
 	bool any = false;
 
+	const int S = SWEET_TOUCH_SUB;	/* x, y in 1/S panel pixel */
 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
 		return;
 	}
-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
+	x = x < 0 ? 0 : (x > 1079 * S ? 1079 * S : x);
+	y = y < 0 ? 0 : (y > 2399 * S ? 2399 * S : y);
 
 	IOLockLock(fLock);
 	bool was = fDown[finger];
 	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp), with sweetfbfit through its scale (and bars). */
 	int fit = sweet_fb_fit;
-	int top = fit == 1 ? SWEET_FIT_Y : 0, bottom = fit == 1 ? SWEET_FIT_Y + SWEET_FIT_H - 1 : 2399;
+	int top = fit == 1 ? SWEET_FIT_Y * S : 0, bottom = fit == 1 ? (SWEET_FIT_Y + SWEET_FIT_H - 1) * S : 2399 * S;
+	int span = fit == 1 ? SWEET_FIT_H * S : 2400 * S;	/* bottom - top + 1 in whole pixels, as before */
 	int fy = y < top ? top : (y > bottom ? bottom : y);
-	IOFixed nx = fit ? (IOFixed)(((int64_t)x << 16) / SWEET_FIT_W) : (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
-	IOFixed ny = fit ? (IOFixed)(((int64_t)(fy - top) << 16) / (bottom - top + 1)) : (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
+	IOFixed nx = fit ? (IOFixed)(((int64_t)x << 16) / (SWEET_FIT_W * S)) :
+	    (IOFixed)(((int64_t)(x + fOffX * S) << 16) / (fLogicalW * S));
+	IOFixed ny = fit ? (IOFixed)(((int64_t)(fy - top) << 16) / span) :
+	    (IOFixed)(((int64_t)(y + fOffY * S) << 16) / (fLogicalH * S));
 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
 	if (was == down && !moved) {
 		IOLockUnlock(fLock);
 		return;
 	}
 	if (!was && down) {
-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
-		    y < top + SWEET_TOUCH_EDGE_PX || y > bottom - SWEET_TOUCH_EDGE_PX;
+		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX * S || x > (1079 - SWEET_TOUCH_EDGE_PX) * S ||
+		    y < top + SWEET_TOUCH_EDGE_PX * S || y > bottom - SWEET_TOUCH_EDGE_PX * S;
 	}
 
 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
@@ -611,7 +664,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
 	IOLockUnlock(fLock);
 
 	if (was != down) {
-		IOLog("SWEET HID: touch %d %s at %d,%d%s\n", finger, down ? "down" : "up", x, y,
+		IOLog("SWEET HID: touch %d %s at %d,%d%s\n", finger, down ? "down" : "up", x / S, y / S,
 		    fEdge[finger] ? " edge" : "");
 	}
 	dispatchEvent(collection);
@@ -639,22 +692,26 @@ SweetHIDTouch::report(UInt32 mask, const int *x, const int *y)
 	uint64_t now = mach_absolute_time();
 
 	IOLockLock(fLock);
-	/* As touch(): sweetfbfit maps through the scale (and bars). */
+	/* As touch(): sweetfbfit maps through the scale (and bars); x, y in 1/S panel pixel. */
+	const int S = SWEET_TOUCH_SUB;
 	int fit = sweet_fb_fit;
-	int top = fit == 1 ? SWEET_FIT_Y : 0, bottom = fit == 1 ? SWEET_FIT_Y + SWEET_FIT_H - 1 : 2399;
+	int top = fit == 1 ? SWEET_FIT_Y * S : 0, bottom = fit == 1 ? (SWEET_FIT_Y + SWEET_FIT_H - 1) * S : 2399 * S;
+	int span = fit == 1 ? SWEET_FIT_H * S : 2400 * S;
 	for (int i = 0; i < SWEET_TOUCH_FINGERS; i++) {
 		UInt32 bit = 1u << i;
 		bool down = (mask & bit) != 0;
-		int px = x[i] < 0 ? 0 : (x[i] > 1079 ? 1079 : x[i]);
-		int py = y[i] < 0 ? 0 : (y[i] > 2399 ? 2399 : y[i]);
+		int px = x[i] < 0 ? 0 : (x[i] > 1079 * S ? 1079 * S : x[i]);
+		int py = y[i] < 0 ? 0 : (y[i] > 2399 * S ? 2399 * S : y[i]);
 		int fy = py < top ? top : (py > bottom ? bottom : py);
 		old |= fDown[i] ? bit : 0;
 		/* A lift keeps the last reported position, not the leave payload. */
-		nx[i] = !down ? fX[i] : fit ? (IOFixed)(((int64_t)px << 16) / SWEET_FIT_W) : (IOFixed)(((int64_t)(px + fOffX) << 16) / fLogicalW);
-		ny[i] = !down ? fY[i] : fit ? (IOFixed)(((int64_t)(fy - top) << 16) / (bottom - top + 1)) : (IOFixed)(((int64_t)(py + fOffY) << 16) / fLogicalH);
+		nx[i] = !down ? fX[i] : fit ? (IOFixed)(((int64_t)px << 16) / (SWEET_FIT_W * S)) :
+		    (IOFixed)(((int64_t)(px + fOffX * S) << 16) / (fLogicalW * S));
+		ny[i] = !down ? fY[i] : fit ? (IOFixed)(((int64_t)(fy - top) << 16) / span) :
+		    (IOFixed)(((int64_t)(py + fOffY * S) << 16) / (fLogicalH * S));
 		edge[i] = !fDown[i] && down ?
-		    px < SWEET_TOUCH_EDGE_PX || px > 1079 - SWEET_TOUCH_EDGE_PX ||
-		    py < top + SWEET_TOUCH_EDGE_PX || py > bottom - SWEET_TOUCH_EDGE_PX : fEdge[i];
+		    px < SWEET_TOUCH_EDGE_PX * S || px > (1079 - SWEET_TOUCH_EDGE_PX) * S ||
+		    py < top + SWEET_TOUCH_EDGE_PX * S || py > bottom - SWEET_TOUCH_EDGE_PX * S : fEdge[i];
 		if (fDown[i] != down || (down && (nx[i] != fX[i] || ny[i] != fY[i]))) {
 			changed |= bit;
 		}
@@ -718,7 +775,7 @@ SweetHIDTouch::report(UInt32 mask, const int *x, const int *y)
 		bool down = (mask & (1u << i)) != 0;
 		if (fDown[i] != down) {
 			IOLog("SWEET HID: touch %d %s at %d,%d%s\n", i, down ? "down" : "up",
-			    x[i], y[i], edge[i] ? " edge" : "");
+			    x[i] / S, y[i] / S, edge[i] ? " edge" : "");
 		}
 		fDown[i] = down;
 		fEdge[i] = edge[i];
@@ -768,8 +825,9 @@ sweet_hid_touch_mode(void)
 	return gSweetTouchMode;
 }
 
+/* x, y in 1/SWEET_TOUCH_SUB panel pixel (fuxitouchfine=1, fuxiflickus). */
 extern "C" void
-sweet_hid_touch(int finger, int down, int x, int y)
+sweet_hid_touch_sub(int finger, int down, int x, int y)
 {
 	__atomic_store_n(&sweet_hid_last_input, mach_absolute_time(), __ATOMIC_RELAXED);
 	if (gSweetTouch) {
@@ -777,12 +835,37 @@ sweet_hid_touch(int finger, int down, int x, int y)
 	}
 }
 
+/* Whole panel pixels, clamped to the panel before scaling, so nothing can overflow. */
+static int
+sweet_hid_touch_scale(int v, int most)
+{
+	return (v < 0 ? 0 : (v > most ? most : v)) * SWEET_TOUCH_SUB;
+}
+
+extern "C" void
+sweet_hid_touch(int finger, int down, int x, int y)
+{
+	sweet_hid_touch_sub(finger, down, sweet_hid_touch_scale(x, 1079), sweet_hid_touch_scale(y, 2399));
+}
+
 extern "C" int
-sweet_hid_touch_report(uint32_t mask, const int *x, const int *y)
+sweet_hid_touch_report_sub(uint32_t mask, const int *x, const int *y)
 {
 	__atomic_store_n(&sweet_hid_last_input, mach_absolute_time(), __ATOMIC_RELAXED);
 	if (gSweetTouch) {
 		return gSweetTouch->report(mask, x, y);
 	}
 	return 0;
+}
+
+extern "C" int
+sweet_hid_touch_report(uint32_t mask, const int *x, const int *y)
+{
+	int sx[SWEET_TOUCH_FINGERS], sy[SWEET_TOUCH_FINGERS];
+
+	for (int i = 0; i < SWEET_TOUCH_FINGERS; i++) {
+		sx[i] = sweet_hid_touch_scale(x[i], 1079);
+		sy[i] = sweet_hid_touch_scale(y[i], 2399);
+	}
+	return sweet_hid_touch_report_sub(mask, sx, sy);
 }

@@ -375,8 +375,52 @@ static void fit_mapping() {
  ft_report(0);
  puts("PASS: sweetfbfit touch: mode 1 x/1080, (y-31)/2338, bars clamp, frame edges; mode 2 x/1080, y/2400, panel edges; batched and per-finger paths; off path unchanged");
 }
+// fuxitouchfine=1: the FTS's 0.1 px reach HID in 1/16 px. Whole-pixel positions map exactly as the old path; a move under
+// a pixel is an event (the old path drops it as unchanged). Both delivery paths, both fit modes.
+static void event10(unsigned kind, unsigned id, unsigned x10, unsigned y10) {
+ uint8_t e[8]={(uint8_t)kind,(uint8_t)((id<<4)|1),(uint8_t)x10,(uint8_t)(x10>>8),(uint8_t)y10,(uint8_t)(y10>>8),0,0};
+ fifo.insert(fifo.end(),e,e+8);
+}
+static void fine_positions() {
+ for(int fit=0;fit<3;fit++) for(int batch=0;batch<2;batch++) {
+  // Whole pixels: the fine path's numbers are the old path's.
+  reset(batch);sweet_fb_fit=fit;event10(FT_EV_ENTER,3,4000,7000);assert(!poll());
+  int oldx=field(child(3),kIOHIDEventFieldDigitizerX), oldy=field(child(3),kIOHIDEventFieldDigitizerY);
+  ft_report(0);
+  reset(batch);sweet_fb_fit=fit;ft.fine=1;event10(FT_EV_ENTER,3,4000,7000);assert(!poll());
+  assert(field(child(3),kIOHIDEventFieldDigitizerX)==oldx && field(child(3),kIOHIDEventFieldDigitizerY)==oldy);
+  assert(ft.xs[3]==400*16 && ft.ys[3]==700*16 && ft.x[3]==400 && ft.y[3]==700);
+  // 0.3 px and 0.7 px further: two events on the fine path, none on the old one.
+  unsigned count=dispatched.size();
+  event10(FT_EV_MOTION,3,4003,7000);assert(!poll() && dispatched.size()==count+1);
+  int x1=field(child(3),kIOHIDEventFieldDigitizerX);assert(x1>oldx);
+  event10(FT_EV_MOTION,3,4007,7000);assert(!poll());assert(field(child(3),kIOHIDEventFieldDigitizerX)>x1);
+  event10(FT_EV_LEAVE,3,0,0);assert(!poll());check(0,1u<<3);
+  reset(batch);sweet_fb_fit=fit;event10(FT_EV_ENTER,3,4000,7000);assert(!poll());count=dispatched.size();
+  event10(FT_EV_MOTION,3,4003,7000);event10(FT_EV_MOTION,3,4007,7000);assert(!poll() && dispatched.size()==count);
+  ft_report(0);
+  // Clamped at the last whole pixel, as before.
+  reset(batch);sweet_fb_fit=fit;ft.fine=1;event10(FT_EV_ENTER,5,65535,65535);assert(!poll());
+  assert(ft.xs[5]==1079*16 && ft.ys[5]==2399*16);ft_report(0);
+ }
+ sweet_fb_fit=0;
+ puts("PASS: fuxitouchfine: whole pixels map as before, sub-pixel moves are events (old path drops them), last-pixel clamp");
+}
+// Status (echo) and error events are logged, at most FT_NOTE_MAX a boot, and change no contact.
+static void status_events() {
+ reset();
+ uint8_t echo[8]={0x43,0x01,0xc0,0x20,0x01,0,0,0}, error[8]={0xf3,0x02,0,0,0,0,0,0};
+ event(FT_EV_ENTER,2,1,400,700);assert(!poll() && dispatched.size()==1);check(1u<<2,0);
+ fifo.insert(fifo.end(),echo,echo+8);fifo.insert(fifo.end(),error,error+8);
+ unsigned before=logs;assert(!poll() && ft.notes==2 && logs==before+2 && dispatched.size()==1 && ft.active==(1u<<2));
+ for(unsigned n=0;n<20;n++)fifo.insert(fifo.end(),echo,echo+8);
+ before=logs;assert(!poll() && ft.notes==22 && logs==before+(FT_NOTE_MAX-2) && dispatched.size()==1);
+ ft_report(0);
+ puts("PASS: FTS status/echo and error events logged (first 8 a boot), contacts untouched");
+}
 int main() {
  batching();coordinates_edges_and_legacy();allocation_failures();fifo_tests();randomized_sets();fit_mapping();
+ fine_positions();status_events();
  assert(!live && !lock_depth);
 }
 '''
@@ -430,11 +474,13 @@ def main():
     hid = (SRC / 'SweetHID.cpp').read_text()
     touch = (SRC / 'fuxi_touch.c').read_text()
     state = touch[touch.index('static struct {'):touch.index('} ft;') + len('} ft;')]
-    fit = '\n' + '\n'.join(re.findall(r'^#define SWEET_FIT_\w+ [^\n]*', hid, re.M)) + '\n'  # state ends without a newline
-    assert fit.count('#define') == 3
-    methods = fit + ''.join(function(hid, name) for name in (
-        'SweetHIDTouch::touch', 'SweetHIDTouch::report',
-        'sweet_hid_touch', 'sweet_hid_touch_report'))
+    fit = '\n' + '\n'.join(re.findall(r'^#define SWEET_(?:FIT_\w+|TOUCH_SUB) [^\n]*', hid, re.M)) + '\n'  # state ends without a newline
+    assert fit.count('#define') == 4
+    ftdefs = '\n'.join(re.findall(r'^#define FT_(?:EV_STATUS|EV_ERROR|NOTE_MAX|SUB) [^\n]*', touch, re.M)) + '\n'
+    assert ftdefs.count('#define') == 4
+    methods = fit + ftdefs + ''.join(function(hid, name) for name in (
+        'SweetHIDTouch::touch', 'SweetHIDTouch::report', 'sweet_hid_touch_sub', 'sweet_hid_touch_scale',
+        'sweet_hid_touch', 'sweet_hid_touch_report_sub', 'sweet_hid_touch_report'))
     driver = ''.join(function(touch, name) for name in (
         'ft_us', 'ft_contact_end', 'ft_report', 'ft_retry_report', 'ft_poll'))
     assert 'unsigned batch;' in state
@@ -442,6 +488,18 @@ def main():
     assert 'ft.batch =' not in touch  # static-zero default; only boot parsing enables it
     assert 'multi %u max %u lifts %u' in touch
     assert function(touch, 'ft_thread').count('ft_retry_report();') == 1
+    # The IC write behind fuxitouchrate=1 only: Lineage's three bytes, sent only by ft_rate_on, which returns
+    # at once unless the argument is exactly 1, and is called only after a successful sense-on.
+    rate = function(touch, 'ft_rate_on')
+    assert 'rate_cmd[] = {0xc0, 0x20, 0x01};' in rate and rate.count('ft_tx(') == 1
+    assert rate.index('if (ft.rate != 1) {') < rate.index('ft_tx(')
+    assert 'PE_parse_boot_argn("fuxitouchrate", &ft.rate, sizeof(ft.rate))' in touch and not re.search(r'ft\.rate = [^=]', touch)
+    # The only byte array starting 0xc0 in the code (the comments spell it 0xC0); ft_rate_on defined and called twice.
+    assert re.findall(r'\{0xc0,', touch) == ['{0xc0,'] and touch.count('ft_rate_on(') == 3
+    thread = function(touch, 'ft_thread')
+    assert re.search(r'sense on failed %d\\n", err\);\n\t\tgoto out;\n\t\}\n\tft_rate_on\("sensing on"\);', thread)
+    assert re.search(r'if \(!serr\) \{\n\t+ft_rate_on\("after a controller reset"\);', thread)
+    assert 'ft.fine = ft.fine == 1;' in thread and 'PE_parse_boot_argn("fuxitouchfine", &ft.fine' in thread
     with tempfile.TemporaryDirectory(prefix='fuxi-touch-test-') as tmp:
         folder = Path(tmp)
         (folder / 'fuxi_key_state.h').write_text((SRC / 'fuxi_key_state.h').read_text())
