@@ -631,15 +631,27 @@ def test_adt(tmp):
                 raise AssertionError('bad refresh accepted')
             except ValueError:
                 pass
+        # /product ui-no-parallax: absent by default; empty, and only once after a rebuild of a template.
+        plain = m.build()
+        assert next(c for c in plain.children if c.name == 'product').prop('ui-no-parallax') is None
+        root = m.set_no_parallax(m.set_no_parallax(m.build()))
+        root, _ = adt.parse(adt.serialize(root))
+        product = next(c for c in root.children if c.name == 'product')
+        assert product.prop('ui-no-parallax') == b'' and [k for k, _, _ in product.props].count('ui-no-parallax') == 1
+        assert product.prop('product-name') == b'iPhone X\0'
+        # The name libMobileGestalt asks for (UIParallaxCapability reads /product oTuH4/axV9s11/jKxB2z2A).
+        import base64, hashlib
+        assert base64.b64encode(hashlib.md5(b'MGCopyAnswerui-no-parallax').digest())[:22] == b'oTuH4/axV9s11/jKxB2z2A'
         mkadt.d22ap_product.__defaults__ = (str(Path(tmp) / 'absent.adt'),)
-        try:
-            m.add_product_children(m.build(), False, True, d22ap)
-            raise AssertionError('ADT without /product accepted')
-        except ValueError:
-            pass
+        for missing_product in (lambda r: m.add_product_children(r, False, True, d22ap), m.set_no_parallax):
+            try:
+                missing_product(m.build())
+                raise AssertionError('ADT without /product accepted')
+            except ValueError:
+                pass
     finally:
         mkadt.d22ap_product.__defaults__ = saved
-    print('PASS: mkadt-fuxi /product/haptics, /product/camera and disp0 display options (off by default)')
+    print('PASS: mkadt-fuxi /product/haptics, /product/camera, ui-no-parallax and disp0 display options (off by default)')
 
 
 # ---- fuxi-sys-root.py -------------------------------------------------------------------

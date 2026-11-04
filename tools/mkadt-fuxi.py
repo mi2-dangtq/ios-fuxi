@@ -14,6 +14,13 @@ the real D22AP tree (an Apple artifact, never in git; --d22ap-adt):
   --product-camera   an empty /product/camera node, no flash (there is no torch);
                      MobileGestalt then reports a camera node; for A/B only
 Both work on a fresh build and on --template.
+
+--no-parallax adds the empty /product property ui-no-parallax, as on Apple
+devices without parallax: MobileGestalt UIParallaxCapability is "that property
+is absent", and UIKit's +[UIMotionEffect _motionEffectsSupported] is that
+answer. With it UIKit never starts device motion for motion effects (home-screen
+wallpaper parallax), so CoreMotion stops retrying gyro/accelerometer HID services
+this phone does not have (research_notes/locationd-motion.md).
 """
 import argparse
 import importlib.util
@@ -172,6 +179,18 @@ def set_display_gamut(root, gamut):
     return root
 
 
+def set_no_parallax(root):
+    """/product ui-no-parallax, empty. libMobileGestalt (iOS 16.7) answers
+    UIParallaxCapability with "IODeviceTree:/product has no ui-no-parallax"
+    (the property is looked up by its obfuscated name oTuH4/axV9s11/jKxB2z2A).
+    Only its presence counts. Replaces an existing one, so a template can be rebuilt."""
+    product = next((n for n in root.children if n.name == 'product'), None)
+    if product is None:
+        raise ValueError('--no-parallax needs a /product node')
+    product.props = [p for p in product.props if p[0] != 'ui-no-parallax'] + [('ui-no-parallax', 0, b'')]
+    return root
+
+
 def set_display_options(root, refresh_mhz=0, swap_hist=False):
     """Opt-in /arm-io/disp0 properties read by SweetFramebuffer (none by default):
     fuxi,refresh-mhz publishes displayMinRefreshInterval at that rate (with fuxipanel120=1),
@@ -226,6 +245,7 @@ def main():
     ap.add_argument('--product-haptics', action='store_true', help='add /product/haptics copied from the D22AP tree')
     ap.add_argument('--product-camera', action='store_true', help='add an empty /product/camera node (no flash)')
     ap.add_argument('--display-gamut', choices=('P3', 'sRGB'), help='set /product artwork-display-gamut (sRGB: no deep colour surfaces)')
+    ap.add_argument('--no-parallax', action='store_true', help='add /product ui-no-parallax: MobileGestalt UIParallaxCapability false, no motion-effect device motion')
     ap.add_argument('--refresh-mhz', type=int, default=0, help='disp0 fuxi,refresh-mhz: CA refresh interval at this rate (e.g. 120800 = measured TE); needs fuxipanel120=1')
     ap.add_argument('--swap-hist', action='store_true', help='disp0 fuxi,swap-hist=1: log SwapEnd interval histogram per SWEET FB stats window')
     ap.add_argument('--d22ap-adt', type=Path, default=Path(mkadt.D22AP_ADT), help='real D22AP device tree (not in git)')
@@ -247,6 +267,8 @@ def main():
         root = add_product_children(root, args.product_haptics, args.product_camera, args.d22ap_adt)
         if args.display_gamut:
             root = set_display_gamut(root, args.display_gamut)
+        if args.no_parallax:
+            root = set_no_parallax(root)
         root = set_display_options(root, args.refresh_mhz, args.swap_hist)
         has_ufs = any(n.name == 'fuxi-ufs' for n in root.children)
         validate_live(args.live_fdt, has_ufs)
