@@ -19,6 +19,24 @@
 
 Only numbers leave the phone in the mic's runs; the probes have no request that returns its samples.
 
+## 4 November: speaker, mic and haptics toward daily use (branch fuxi-audio2; notes in research_notes/loa-mic-rung.md, not in this repository)
+
+- **Roots v20 to v33 have VirtualAudio disabled again** (measured on the images: v9 and v19 have it in `HAL`, v20, v29, v33 in
+  `HAL.disabled`): `mk-root-v20.sh` ran `sweet-root-tweaks.py` without `--only-optional`, so its base `audio()` step ran again.
+  Without VirtualAudio mediaserverd routes everything to the null device ("vaemGetVirtualAudioDeviceIDs: No Audio Device
+  Available" in h-fit2b), so no speaker, mic or haptics even with `ADSP=1 FUXIAUDIO=2 AMP=2`. Root v34au (`boot/mk-root-v34au.sh`)
+  moves it back. Every later root script must use `--only-optional`.
+- **Haptics:** the motor is PM8550B's HAP525_HV block over SPMI (USID 7, HAP_CFG 0x7F000, HAP_PTN 0x7F100, HAP_HBST 0x7F200;
+  live DT `qcom,hv-haptics@f000`, LRA f0 160-185 Hz, constant-play VMAX 1200 mV). Writing it is a PMIC write: nothing here does.
+  iOS renders every haptic (UIKit taps, CoreHaptics, ringer and system-sound vibration) as 48 kHz mono 16 bit on
+  `VirtualAudioDevice_Actuator` over FuxiAudio's "Actuator" once the ADT has `/product/haptics closed-loop`
+  (`boot/add-haptics-adt.py`) and VirtualAudio is on. `fuxihaptic=1` makes `/dev/fuxihaptic`, which the plug-in feeds and which
+  counts and says each event (tap or vibration, length, peak, RMS, pitch); no motor is driven.
+- **Mic:** the plug-in takes VirtualAudio's data-source list when it names 'imic' (it refused it on every input route in r-v19 and
+  a-v8c, `!siz`), and says its first samples and peak. The test app is Voice Memos (root v34au-vm installs it from the staged apps).
+- **ADSP upload:** OUT 0x5b takes chunks up to 4 KiB (`fuxi-audio-probe.py upload --chunk 4096`), against about 53 s a boot at 512
+  bytes; tools/test-fuxi-audio-stage.py checks the staging on the host. Not yet timed on the phone.
+
 ## Milestone 1 (research + probes)
 
 Goal: iOS sound on the fuxi speakers, then headphones over USB-C. This round
