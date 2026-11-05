@@ -246,6 +246,8 @@ kernel() {
     python3 tools/sync-fuxi-args.py --check
     python3 tools/test-fuxi-vmwatch.py
     python3 tools/sync-fuxi-vmwatch.py --check
+    python3 tools/test-fuxi-hapread.py
+    python3 tools/sync-fuxi-hapread.py --check
     python3 tools/test-fuxi-audio-amp-on.py
     python3 tools/sync-fuxi-audio.py --check
     python3 tools/test-fuxi-pac.py

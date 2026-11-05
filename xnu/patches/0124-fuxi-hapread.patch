@@ -1,0 +1,418 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,4 +117,5 @@
+ bsd/dev/fuxi_audioreach.c		standard
+ bsd/dev/fuxi_audio_dsp.c		standard
++bsd/dev/fuxi_hapread.c		standard
+ bsd/dev/fuxi_keys.c			standard
+ bsd/dev/fuxi_wlan.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -63,6 +63,7 @@
+ extern void fuxi_keys_init(void);
+ extern void fuxi_wlan_init(void);
+ extern void fuxi_audio_dsp_init(void);
++extern void fuxi_hapread_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -960,6 +961,8 @@
+ 	fuxi_wlan_init();
+ 	/* The ADSP the loader left running, boot-arg fuxiaudio (bsd/dev/fuxi_audio_dsp.c). */
+ 	fuxi_audio_dsp_init();
++	/* Haptics step H1, boot-arg fuxihapread=1: a read-only look at the PMIC's haptics (bsd/dev/fuxi_hapread.c). */
++	fuxi_hapread_init();
+ #else
+ 	sweet_log_start();
+ 	sweet_sample_start();
+--- /dev/null
++++ b/bsd/dev/fuxi_hapread.c
+@@ -0,0 +1,388 @@
++/*
++ * FUXI HAPREAD: haptics step H1 (research_notes/loa-mic-rung.md 3.4), boot-arg fuxihapread=1, off by default.
++ * Without the boot-arg fuxi_hapread_init() returns at once: nothing is mapped, read or started.
++ *
++ * A read-only look at the PMIC's haptics before anything drives the motor. Hardware (the phone's live DT):
++ *   PM8550B, SPMI SID 7, qcom,hv-haptics@f000 ("qcom,hv-haptics", HAP525_HV): HAP_CFG 0xf000 (PPID 0x7f0),
++ *   HAP_PTN 0xf100 (0x7f1), HAP_HBST 0xf200 (0x7f2, the haptics' own boost); its nvmem "hap_cfg_sdam" is
++ *   PMK8550 (SID 0) sdam@9d00, SDAM46 (PPID 0x09d).
++ * Register names and meanings: qcom-hv-haptics.c (LineageOS android_kernel_xiaomi_sm8550 @f9ca2b71f672).
++ *
++ * READ ONLY. The arbiter, channel and EE of bsd/dev/fuxi_keys.c: SPMI PMIC arbiter v7 (qcom,spmi@c42d000, EE 0),
++ * core 0x0c400000 (version, APID count, APID map 0x2000 + 4n), cnfg 0x0c42d000 (owner table 4n), obsrvr
++ * 0x0c440000 (EE 0's observer channels, 0x20 per APID: CMD 0x00, STATUS 0x08, RDATA0 0x18), offsets as Linux
++ * drivers/spmi/spmi-pmic-arb.c v7. The one store in this file is fhr_ask(): the EXT_READL command word (opcode 1,
++ * one byte) on an observer channel. The read/write channels (chnls 0x0c500000) are never mapped, and no other
++ * opcode, data-out register or helper that stores exists here; tools/test-fuxi-hapread.py fails if one appears.
++ * SDAM46 is only looked up in the arbiter's tables: not one of its registers is read.
++ *
++ * Reads, one byte per command, the note's list and nothing else:
++ *   HAP_CFG  0x01, 0x04-0x05, 0x09-0x0e, 0x10, 0x46-0x4e, 0x50-0x53, 0x5c-0x68
++ *   HAP_PTN  0x01, 0x04-0x05, 0x24-0x2b, 0x70-0x77
++ *   HAP_HBST 0x00-0x01
++ * Every poll is bounded (FHR_POLLS x delay(1), about 1 ms); a read with no answer is said and ends the dump.
++ * The last lines say whether step H2 (one 20 ms pulse: a PMIC write that needs the owner) would pass the note's
++ * stop conditions. It only prints; it decides nothing and starts nothing.
++ */
++#if defined(FUXI)
++#include <stdint.h>
++#include <stdbool.h>
++#include <string.h>
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "sweet_spmi_bus.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++void fuxi_hapread_init(void);
++
++#define FHR_CORE_PA     0x0c400000u
++#define FHR_CORE_SIZE   0x3000u
++#define FHR_CNFG_PA     0x0c42d000u
++#define FHR_CNFG_SIZE   0x1000u
++#define FHR_OBS_PA      0x0c440000u    /* EE 0 */
++#define FHR_OBS_SIZE    0x8000u
++#define FHR_MAP_OFF     0x2000u
++#define FHR_MAX_APIDS   1024u
++#define FHR_CHAN_STRIDE 0x20u
++#define FHR_CMD         0x00u
++#define FHR_STATUS      0x08u
++#define FHR_RDATA0      0x18u
++#define FHR_DONE        0x01u
++#define FHR_ERRORS      0x0eu          /* failure 0x2, denied 0x4, dropped 0x8 */
++#define FHR_EXT_READL   (1u << 27)     /* opcode 1, byte count 0: one byte */
++#define FHR_POLLS       1000u
++#define FHR_NO_APID     0xffffu
++
++enum { FHR_CFG, FHR_PTN, FHR_HBST, FHR_SDAM, FHR_PERIPHS };
++
++static const struct fhr_periph {
++	const char *name;
++	uint16_t ppid;          /* SID << 8 | peripheral */
++	bool read;              /* false: the arbiter's tables only */
++} fhr_periphs[FHR_PERIPHS] = {
++	[FHR_CFG] = { "HAP_CFG", 0x7f0, true },
++	[FHR_PTN] = { "HAP_PTN", 0x7f1, true },
++	[FHR_HBST] = { "HAP_HBST", 0x7f2, true },
++	[FHR_SDAM] = { "SDAM46", 0x09d, false },
++};
++
++static const struct fhr_range {
++	uint8_t periph, first, last;
++} fhr_ranges[] = {
++	{ FHR_CFG, 0x01, 0x01 },        /* REVISION2: 0x04 = HAP525_HV */
++	{ FHR_CFG, 0x04, 0x05 },        /* type, subtype */
++	{ FHR_CFG, 0x09, 0x0e },        /* STATUS_DATA MSB/LSB, HPWR_INTF, FAULT_STATUS, HW_CONFIG, LRA impedance */
++	{ FHR_CFG, 0x10, 0x10 },        /* INT_RT_STS */
++	{ FHR_CFG, 0x46, 0x4e },        /* EN_CTL, DRV_CTRL, VMAX, DRV_WF_SEL, AUTO_SHUTDOWN, TRIG_PRIORITY, SPMI_PLAY, EXT_TRIG, SWR_ACCESS */
++	{ FHR_CFG, 0x50, 0x53 },        /* BRAKE_MODE, CL_BRAKE CFG, CAL_PARAM, RSET */
++	{ FHR_CFG, 0x5c, 0x68 },        /* TLRA_OL, RC_CLK_CAL_COUNT, duties, ZX window, AUTORES, ISC, FAULT_CLR, VMAX_HDRM, VSET */
++	{ FHR_PTN, 0x01, 0x01 },        /* REVISION2 */
++	{ FHR_PTN, 0x04, 0x05 },        /* type, subtype */
++	{ FHR_PTN, 0x24, 0x2b },        /* FIFO_PLAY_RATE, DIRECT_PLAY 0x26, AUTORES_CAL 0x28, FIFO empty/depth (not the FIFO ports) */
++	{ FHR_PTN, 0x70, 0x77 },        /* BRAKE_AMP */
++	{ FHR_HBST, 0x00, 0x01 },       /* REVISION1, REVISION2: 0x0001 = boost switched through SDAM's PBS */
++};
++#define FHR_RANGES (sizeof(fhr_ranges) / sizeof(fhr_ranges[0]))
++
++static vm_offset_t fhr_core, fhr_cnfg, fhr_obs;
++static uint16_t fhr_apid[FHR_PERIPHS];
++static unsigned fhr_owner[FHR_PERIPHS];
++static uint8_t fhr_val[FHR_SDAM][256];
++static bool fhr_have[FHR_SDAM][256];
++static uint32_t fhr_status;
++static unsigned fhr_reads, fhr_refused;
++static bool fhr_stuck;                  /* a read went unanswered: nothing more is asked */
++
++static uint32_t
++fhr_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++/* The only store in this file: EXT_READL of one byte at reg, on EE 0's observer channel chan. */
++static void
++fhr_ask(vm_offset_t chan, uint8_t reg)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(chan + FHR_CMD) = FHR_EXT_READL | ((uint32_t)reg << 4);
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/* 0: read; 1: done with an error bit (fhr_status), the transaction is over; 2: no answer within FHR_POLLS. */
++static int
++fhr_read_locked(uint16_t apid, uint8_t reg, uint8_t *out)
++{
++	vm_offset_t chan = fhr_obs + FHR_CHAN_STRIDE * apid;
++	fhr_ask(chan, reg);
++	for (unsigned i = 0; i < FHR_POLLS; ++i) {
++		fhr_status = fhr_rd(chan, FHR_STATUS);
++		if (fhr_status & FHR_DONE) {
++			if (fhr_status & FHR_ERRORS) {
++				return 1;
++			}
++			*out = (uint8_t)fhr_rd(chan, FHR_RDATA0);
++			return 0;
++		}
++		delay(1);
++	}
++	return 2;
++}
++
++static int
++fhr_read(uint16_t apid, uint8_t reg, uint8_t *out)
++{
++	sweet_spmi_bus_lock();
++	int rc = fhr_read_locked(apid, reg, out);
++	sweet_spmi_bus_unlock();
++	return rc;
++}
++
++/* Every mapping of the PPID; the one read through is EE 0's when there is one (fuxi_keys.c's and Linux's rule). */
++static void
++fhr_find(unsigned p, uint32_t count)
++{
++	char list[96];
++	size_t len = 0;
++	unsigned maps = 0;
++
++	list[0] = '\0';
++	fhr_apid[p] = FHR_NO_APID;
++	fhr_owner[p] = 7;
++	for (uint32_t i = 0; i < count; ++i) {
++		uint32_t map = fhr_rd(fhr_core, FHR_MAP_OFF + 4u * i);
++		if (map == 0 || ((map >> 8) & 0xfffu) != fhr_periphs[p].ppid) {
++			continue;
++		}
++		unsigned owner = fhr_rd(fhr_cnfg, 4u * i) & 7u;
++		if (fhr_apid[p] == FHR_NO_APID || owner == 0) {
++			fhr_apid[p] = (uint16_t)i;
++			fhr_owner[p] = owner;
++		}
++		if (len < sizeof(list)) {
++			int n = snprintf(list + len, sizeof(list) - len, " %u/ee%u%s", i, owner, ((map >> 24) & 1u) ? "/irq" : "");
++			len = n > 0 ? len + (size_t)n : len;
++		}
++		++maps;
++	}
++	if (fhr_apid[p] == FHR_NO_APID) {
++		printf("FUXI HAPREAD: %s ppid 0x%03x: not in the APID map\n", fhr_periphs[p].name, fhr_periphs[p].ppid);
++	} else {
++		printf("FUXI HAPREAD: %s ppid 0x%03x: apid %u owner ee%u; %u mapping(s) apid/owner:%s%s\n",
++		    fhr_periphs[p].name, fhr_periphs[p].ppid, fhr_apid[p], fhr_owner[p], maps, list,
++		    fhr_periphs[p].read ? "" : " (tables only, nothing read)");
++	}
++}
++
++/* One range, one line. A refused byte shows as "!!", one never asked as "--". */
++static void
++fhr_dump(const struct fhr_range *g)
++{
++	const char *name = fhr_periphs[g->periph].name;
++	uint16_t apid = fhr_apid[g->periph];
++	char line[3 * 16 + 1], tail[48];
++	size_t len = 0;
++	unsigned refused = 0;
++	uint32_t refused_status = 0;
++
++	if (!fhr_periphs[g->periph].read) {
++		return;
++	}
++	line[0] = '\0';
++	tail[0] = '\0';
++	for (unsigned reg = g->first; reg <= g->last; ++reg) {
++		uint8_t v = 0;
++		int rc = 3;
++		if (!fhr_stuck && apid != FHR_NO_APID) {
++			rc = fhr_read(apid, (uint8_t)reg, &v);
++			++fhr_reads;
++		}
++		if (rc == 0) {
++			fhr_val[g->periph][reg] = v;
++			fhr_have[g->periph][reg] = true;
++		} else if (rc == 1) {
++			++refused;
++			++fhr_refused;
++			refused_status = fhr_status;
++		} else if (rc == 2) {
++			fhr_stuck = true;
++			printf("FUXI HAPREAD: %s 0x%02x: no answer after %u polls (status 0x%x); giving up, nothing more is read\n",
++			    name, reg, FHR_POLLS, fhr_status);
++		}
++		if (len < sizeof(line)) {
++			int n = rc == 0 ? snprintf(line + len, sizeof(line) - len, " %02x", v) :
++			    snprintf(line + len, sizeof(line) - len, "%s", rc == 1 ? " !!" : " --");
++			len = n > 0 ? len + (size_t)n : len;
++		}
++	}
++	if (refused) {
++		(void)snprintf(tail, sizeof(tail), " (%u refused, status 0x%x)", refused, refused_status);
++	}
++	if (g->first == g->last) {
++		printf("FUXI HAPREAD: %s 0x%02x:%s%s\n", name, g->first, line, tail);
++	} else {
++		printf("FUXI HAPREAD: %s 0x%02x-0x%02x:%s%s\n", name, g->first, g->last, line, tail);
++	}
++}
++
++static bool
++fhr_got(unsigned p, unsigned reg, uint8_t *v)
++{
++	*v = fhr_val[p][reg];
++	return fhr_have[p][reg];
++}
++
++static void
++fhr_because(char *buf, size_t cap, unsigned *n, const char *reason)
++{
++	(void)strlcat(buf, *n ? "; " : "", cap);
++	(void)strlcat(buf, reason, cap);
++	++*n;
++}
++
++/* The note's stop conditions for H1/H2, every one of them, on what was read. */
++static void
++fhr_verdict(void)
++{
++	char no[512], r[96];
++	unsigned n = 0;
++	uint8_t cfg_rev = 0, ptn_rev = 0, en = 0, play = 0, fault = 0, b0 = 0, b1 = 0;
++	bool all = !fhr_stuck && fhr_refused == 0;
++
++	no[0] = '\0';
++	for (unsigned i = 0; i < FHR_RANGES; ++i) {
++		for (unsigned reg = fhr_ranges[i].first; reg <= fhr_ranges[i].last; ++reg) {
++			all = all && fhr_have[fhr_ranges[i].periph][reg];
++		}
++	}
++	if (!all) {
++		(void)snprintf(r, sizeof(r), "the dump is not complete (%u refused%s)", fhr_refused,
++		    fhr_stuck ? ", a read went unanswered" : "");
++		fhr_because(no, sizeof(no), &n, r);
++	}
++	bool cfg_ok = fhr_got(FHR_CFG, 0x01, &cfg_rev);
++	bool ptn_ok = fhr_got(FHR_PTN, 0x01, &ptn_rev);
++	if (!cfg_ok || !ptn_ok || cfg_rev != 0x04 || ptn_rev != 0x04) {
++		(void)snprintf(r, sizeof(r), "revision 0x%02x/0x%02x, not 0x04/0x04", cfg_rev, ptn_rev);
++		fhr_because(no, sizeof(no), &n, r);
++	}
++	for (unsigned p = FHR_CFG; p <= FHR_PTN; ++p) {
++		if (fhr_apid[p] == FHR_NO_APID) {
++			(void)snprintf(r, sizeof(r), "%s has no APID", fhr_periphs[p].name);
++			fhr_because(no, sizeof(no), &n, r);
++		} else if (fhr_owner[p] != 0) {
++			(void)snprintf(r, sizeof(r), "%s owned by ee%u, not ee0", fhr_periphs[p].name, fhr_owner[p]);
++			fhr_because(no, sizeof(no), &n, r);
++		}
++	}
++	if (fhr_got(FHR_CFG, 0x46, &en) && !(en & 0x80u)) {
++		(void)snprintf(r, sizeof(r), "0x46 bit 7 (HAPTICS_EN) is 0 (0x%02x)", en);
++		fhr_because(no, sizeof(no), &n, r);
++	}
++	if (fhr_got(FHR_CFG, 0x4c, &play) && (play & 0x80u)) {
++		(void)snprintf(r, sizeof(r), "0x4c bit 7 (PLAY_EN) is set (0x%02x): playing", play);
++		fhr_because(no, sizeof(no), &n, r);
++	}
++	if (fhr_got(FHR_CFG, 0x0c, &fault) && fault != 0) {
++		(void)snprintf(r, sizeof(r), "0x0c (FAULT_STATUS) is 0x%02x", fault);
++		fhr_because(no, sizeof(no), &n, r);
++	}
++	bool b0_ok = fhr_got(FHR_HBST, 0x00, &b0);
++	bool b1_ok = fhr_got(FHR_HBST, 0x01, &b1);
++	unsigned hbst_rev = (unsigned)b1 << 8 | b0;
++	if (b0_ok && b1_ok && hbst_rev == 0x0001) {
++		fhr_because(no, sizeof(no), &n, "HBST revision 0x0001 (boost through SDAM)");
++	}
++	if (n) {
++		printf("FUXI HAPREAD: H2 would be allowed: no, because %s\n", no);
++	} else {
++		printf("FUXI HAPREAD: H2 would be allowed: yes, because revision 0x04/0x04, HAP_CFG apid %u and HAP_PTN apid %u "
++		    "owned by ee0, 0x46 0x%02x (HAPTICS_EN on), 0x4c 0x%02x (not playing), 0x0c 0x00, HBST revision 0x%04x\n",
++		    fhr_apid[FHR_CFG], fhr_apid[FHR_PTN], en, play, hbst_rev);
++	}
++}
++
++/* Plain words for a few bytes of the dump, nothing more. */
++static void
++fhr_decode(void)
++{
++	uint8_t vmax = 0, hw = 0, intf = 0, msb = 0, lsb = 0, imp = 0, rt = 0, direct = 0;
++	bool all = fhr_got(FHR_CFG, 0x0d, &hw);
++	all = fhr_got(FHR_CFG, 0x48, &vmax) && all;
++	all = fhr_got(FHR_CFG, 0x5c, &msb) && all;
++	all = fhr_got(FHR_CFG, 0x5d, &lsb) && all;
++	all = fhr_got(FHR_CFG, 0x0b, &intf) && all;
++	all = fhr_got(FHR_CFG, 0x0e, &imp) && all;
++	all = fhr_got(FHR_CFG, 0x10, &rt) && all;
++	all = fhr_got(FHR_PTN, 0x26, &direct) && all;
++	unsigned step = (hw & 0x02u) ? 50u : 32u;      /* HW_CONFIG bit 1: HV driver, 50 mV VMAX steps */
++
++	printf("FUXI HAPREAD: decoded: VMAX %u mV (%u mV steps), TLRA_OL %u us, HPWR_INTF %u, LRA impedance %u mOhm, "
++	    "INT_RT_STS 0x%02x, DIRECT_PLAY 0x%02x%s\n",
++	    vmax * step, step, (((unsigned)msb & 0x0fu) << 8 | lsb) * 5u, intf & 3u, imp * 250u, rt, direct,
++	    all ? "" : " (a byte not read counts as 0)");
++}
++
++static void
++fhr_run(void)
++{
++	fhr_core = ml_io_map(FHR_CORE_PA, FHR_CORE_SIZE);
++	fhr_cnfg = ml_io_map(FHR_CNFG_PA, FHR_CNFG_SIZE);
++	fhr_obs = ml_io_map(FHR_OBS_PA, FHR_OBS_SIZE);
++	if (!fhr_core || !fhr_cnfg || !fhr_obs) {
++		printf("FUXI HAPREAD: MMIO mapping failed; nothing read\n");
++		return;
++	}
++	uint32_t version = fhr_rd(fhr_core, 0);
++	uint32_t count = fhr_rd(fhr_core, 4) & 0x7ffu;
++	if (version < 0x70000000u || version >= 0x80000000u || count == 0 || count > FHR_MAX_APIDS) {
++		printf("FUXI HAPREAD: unsupported arbiter version=0x%x apids=%u; nothing read\n", version, count);
++		return;
++	}
++	printf("FUXI HAPREAD: arbiter 0x%x, %u apids; reading as ee0 through observer channels, one byte a command, no write\n",
++	    version, count);
++	for (unsigned p = 0; p < FHR_PERIPHS; ++p) {
++		fhr_find(p, count);
++	}
++	for (unsigned i = 0; i < FHR_RANGES; ++i) {
++		fhr_dump(&fhr_ranges[i]);
++	}
++	fhr_decode();
++	fhr_verdict();
++	printf("FUXI HAPREAD: done: %u reads, %u refused, %s; no PMIC register was written\n",
++	    fhr_reads, fhr_refused, fhr_stuck ? "stopped at an unanswered read" : "none unanswered");
++}
++
++static void
++fhr_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	fhr_run();
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++fuxi_hapread_init(void)
++{
++	int on = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("fuxihapread", &on, sizeof(on)) || on != 1) {
++		return;
++	}
++	if (kernel_thread_start(fhr_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("FUXI HAPREAD: kernel_thread_start failed; nothing read\n");
++	}
++}
++#endif /* FUXI */

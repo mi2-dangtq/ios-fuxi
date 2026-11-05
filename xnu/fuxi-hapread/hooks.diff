@@ -1,0 +1,27 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,4 +117,5 @@
+ bsd/dev/fuxi_audioreach.c		standard
+ bsd/dev/fuxi_audio_dsp.c		standard
++bsd/dev/fuxi_hapread.c		standard
+ bsd/dev/fuxi_keys.c			standard
+ bsd/dev/fuxi_wlan.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -63,6 +63,7 @@
+ extern void fuxi_keys_init(void);
+ extern void fuxi_wlan_init(void);
+ extern void fuxi_audio_dsp_init(void);
++extern void fuxi_hapread_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -960,6 +961,8 @@
+ 	fuxi_wlan_init();
+ 	/* The ADSP the loader left running, boot-arg fuxiaudio (bsd/dev/fuxi_audio_dsp.c). */
+ 	fuxi_audio_dsp_init();
++	/* Haptics step H1, boot-arg fuxihapread=1: a read-only look at the PMIC's haptics (bsd/dev/fuxi_hapread.c). */
++	fuxi_hapread_init();
+ #else
+ 	sweet_log_start();
+ 	sweet_sample_start();
