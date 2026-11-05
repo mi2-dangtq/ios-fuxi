@@ -370,14 +370,14 @@
 +		printf("FUXI HAPREAD: MMIO mapping failed; nothing read\n");
 +		return;
 +	}
-+	uint32_t version = fhr_rd(fhr_core, 0);
++	uint32_t arb = fhr_rd(fhr_core, 0);
 +	uint32_t count = fhr_rd(fhr_core, 4) & 0x7ffu;
-+	if (version < 0x70000000u || version >= 0x80000000u || count == 0 || count > FHR_MAX_APIDS) {
-+		printf("FUXI HAPREAD: unsupported arbiter version=0x%x apids=%u; nothing read\n", version, count);
++	if (arb < 0x70000000u || arb >= 0x80000000u || count == 0 || count > FHR_MAX_APIDS) {
++		printf("FUXI HAPREAD: unsupported arbiter version=0x%x apids=%u; nothing read\n", arb, count);
 +		return;
 +	}
 +	printf("FUXI HAPREAD: arbiter 0x%x, %u apids; reading as ee0 through observer channels, one byte a command, no write\n",
-+	    version, count);
++	    arb, count);
 +	for (unsigned p = 0; p < FHR_PERIPHS; ++p) {
 +		fhr_find(p, count);
 +	}

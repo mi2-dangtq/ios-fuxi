@@ -483,7 +483,7 @@ def dynamic_checks(src, tmp):
 STUBS = {
     'sys/param.h': '#include <stddef.h>\n',
     'string.h': 'typedef __SIZE_TYPE__ size_t;\nsize_t strlcat(char *, const char *, size_t);\n',
-    'sys/systm.h': ('typedef __SIZE_TYPE__ size_t;\nint printf(const char *, ...) __attribute__((format(printf, 1, 2)));\n'
+    'sys/systm.h': ('typedef __SIZE_TYPE__ size_t;\nextern char version[];\nint printf(const char *, ...) __attribute__((format(printf, 1, 2)));\n'
                     'int snprintf(char *, size_t, const char *, ...) __attribute__((format(printf, 3, 4)));\n'),
     'kern/clock.h': 'extern void delay(int usec);\n',
     'kern/thread.h': ('#include <mach_types_stub.h>\nextern kern_return_t kernel_thread_start(thread_continue_t, void *, '
