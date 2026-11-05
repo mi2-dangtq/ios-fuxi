@@ -145,14 +145,15 @@ static int round(io_connect_t c,bool hang)
      hang ? "status reports watchdog loss" : "healthy status unchanged",kr);
  return errors;
 }
-/* Explicit resource stress uses only 16 MiB ordinary + 16 MiB imported backing,
- * in separate phases. Never run automatically through exec-swap host argv.
+/* Explicit resource stress uses only 64 MiB ordinary (FG_ABI_MAX_BOS 16K BOs) + 32 MiB
+ * imported backing, in separate phases. Never run automatically through exec-swap host argv.
  * Each import is a BO of this client too, so one client maps at most
- * FG_ABI_MAX_BOS imports even though the kernel's import table holds more. */
+ * min(FG_ABI_MAX_IMPORTS, FG_ABI_MAX_BOS) imports (2048 since the 4096-slot BO table). */
 static int limits(io_connect_t c)
 {
  int errors=0;
- uint64_t handles[FG_ABI_MAX_BOS]={};
+ static uint64_t handles[FG_ABI_MAX_BOS]; /* 32 KiB: not on the stack */
+ memset(handles,0,sizeof(handles));
  unsigned count=0;
  NativeAdrenoAbiBoAlloc alloc{16384,14,0};NativeAdrenoAbiBoAllocReply reply{};
  kern_return_t kr=0;
@@ -161,7 +162,7 @@ static int limits(io_connect_t c)
   if (kr || !reply.handle) break;
   handles[count]=reply.handle;
  }
- errors+=line(count==FG_ABI_MAX_BOS,"1024 live BOs",kr);
+ errors+=line(count==FG_ABI_MAX_BOS,"BO table full (FG_ABI_MAX_BOS live BOs)",kr);
  if (!errors) { kr=call(c,2,&alloc,&reply);errors+=line(kr && !reply.handle,"BO table bound refuses overflow",kr); }
  for (unsigned i=0;i<count;i++) {
   NativeAdrenoAbiBoFree release{handles[i]};kr=call(c,4,&release,nullptr);
@@ -182,7 +183,7 @@ static int limits(io_connect_t c)
   NativeAdrenoAbiBoMapReply mapped{};kr=call(c,3,&map,&mapped);
   if (kr || mapped.iova!=map.iova) { errors+=line(false,"stress import map",kr);++count;break; }
  }
- errors+=line(count==imports && !kr && !errors,"1024 mapped host imports",kr);
+ errors+=line(count==imports && !kr && !errors,"import table full (mapped host imports)",kr);
  bool released=true;
  for (unsigned i=0;i<count;i++) {
   NativeAdrenoAbiBoFree release{handles[i]};kr=call(c,4,&release,nullptr);

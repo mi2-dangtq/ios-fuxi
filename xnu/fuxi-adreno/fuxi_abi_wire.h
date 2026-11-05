@@ -10,14 +10,20 @@
 #define FG_ABI_PA_BITS 36u /* Fuxi ID2.OAS=1; existing present mapper has the same limit. */
 #define FG_ABI_MAX_BYTES (UINT64_C(1) << 28)
 /* Internal quotas, independent of the unchanged per-object wire limit. */
-#define FG_ABI_MAX_BOS 1024u
+/* BOs of one client at once, allocated and imported (the user client's table and handle index), and entries of the backend's map notes
+ * (fg_abi_maps). v-imp4 (YouTube in Safari, FuxiMetal d335af6): backboardd reached the old 1024 with 754 mapped imports and ~270
+ * allocated BOs, BoImport refused at stage 3 and FuxiMetal fell back to the CPU. At 4096 the import table below (2048) is reached first
+ * with up to 2048 allocated BOs beside it. Cost: 184 bytes a slot per open client (152 the Bo, 32 its two index cells), 736 KiB, and
+ * 32 bytes a map note (128 KiB, static). The user client's per-CPU-map token search and the backend's unmap search stop at the highest
+ * live slot (top_, fg_abi_map_top), so the size costs nothing per call. A power of two (FuxiHandleIndex). Kernel-only. */
+#define FG_ABI_MAX_BOS 4096u
 #define FG_ABI_MAX_WIRED_BYTES (UINT64_C(768) << 20)
 /* Mapped host imports at once, in the backend's global table (fg_abi_imports). Each import is also a BO of the one open client, so that
- * client's imports stop at FG_ABI_MAX_BOS less its allocated BOs (BoImport stage 3); the rest is room for BOs a closed client left
- * quarantined (still mapped until reset). v-yuv1 (YouTube in Safari, FuxiMetal d92d25b, two imports per video frame) held the old 512
- * full in eight windows while BoMap refused 1,294 imports, and the same backboardd fell back to 116-169 once the video page went: a
- * working set, not a leak. Scans of the table stop at fg_abi_import_top, so the size costs nothing per submit. Kernel-only: no wire
- * structure or userland (Turnip, FuxiMetal) is sized by it. */
+ * client's imports stop here or at FG_ABI_MAX_BOS less its allocated BOs (BoImport stage 3), whichever comes first; the rest is room
+ * for BOs a closed client left quarantined (still mapped until reset). v-yuv1 (YouTube in Safari, FuxiMetal d92d25b, two imports per
+ * video frame) held the old 512 full in eight windows while BoMap refused 1,294 imports, and the same backboardd fell back to 116-169
+ * once the video page went: a working set, not a leak. Scans of the table stop at fg_abi_import_top, so the size costs nothing per
+ * submit. Kernel-only: no wire structure or userland (Turnip, FuxiMetal) is sized by it. */
 #define FG_ABI_MAX_IMPORTS 2048u
 /* A BO that does not require one physical run asks for one only up to 128 KiB, and not for 5 s after a failed search of its size or
  * less (UniXNU Adreno740 01ed692, MIT). A search the kernel cannot serve scans every free page first: theirs took 21.7 s over 124

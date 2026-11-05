@@ -97,7 +97,7 @@ int main() {
  tickScale=1;logCount=0;fuxi_gpu_abi_stats_log();
  assert(logCount==1 && strstr(logs[0]," sleep 3/"));
  // submit_split: a 600-submit window is one report; a lock_ wait over 500 us is blamed on the selector that released lock_ last.
- logCount=0;tickScale=1;
+ logCount=0;tickScale=1;boTop=410; /* the open client's BO table mark, printed beside live_bos */
  abiSplit(FG_SPLIT_RELEASE,5);abiSplit(FG_SPLIT_LOCKED,6400000);abiSplit(FG_SPLIT_RELEASE,6);abiSplit(FG_SPLIT_LOCKED,100000);
  for(unsigned i=0;i<FG_SPLIT_WINDOW;i++){
   assert(!logCount);
@@ -105,7 +105,7 @@ int main() {
   abiSplit(FG_SPLIT_TOTAL,3600000);abiSplit(FG_SPLIT_BOS,2);abiSplit(FG_SPLIT_LIVE,406);abiSplit(FG_SPLIT_ATT,3);abiSplit(FG_SPLIT_WAITS,2);abiSplit(FG_SPLIT_EVENTS,1);abiSplit(FG_SPLIT_DONE,0);
  }
  assert(logCount==8);
- assert(strstr(logs[0],"submit_split n 600 us/submit total 3600.0 args 1.0 fence_wait 0.0 lookup 2.0 backend 3000.0 retry_sleep 500.0 rest 97.0 attempts 3.0 waits 2.0 events 1.0 ibs 2.0 live_bos 406 lookup_ns_per_ib 1000"));
+ assert(strstr(logs[0],"submit_split n 600 us/submit total 3600.0 args 1.0 fence_wait 0.0 lookup 2.0 backend 3000.0 retry_sleep 500.0 rest 97.0 attempts 3.0 waits 2.0 events 1.0 ibs 2.0 live_bos 406 top 410 of 4096 lookup_ns_per_ib 1000"));
  assert(strstr(logs[1],"att 900 ok 600 ref 300 (busy/hold/noq/pw/full 1/2/3/4/5)") && strstr(logs[1],"lockwait 4.6 max 6.4") && strstr(logs[1],"refused_us 16.0"));
  assert(strstr(logs[2],"waits/submit by kind: hold 0.0 (0 us each) copy 0.0 (0 us each) other 0.0 (0 us each); event wakes 600 of 1200"));
  assert(strstr(logs[3],"dirty state 2 (2 active 3 refused) tracked_imports 7 submits 600 per submit: pages_checked 3300 dirty 40 kb_cleaned 640 full_kb 0 check_us 900.0 clean_us 100.0 per_page_ns 272 ivac_us 300.0"));

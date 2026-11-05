@@ -4756,7 +4756,7 @@
 +SOFTWARE.
 --- a/bsd/dev/fuxi_gpu_abi_backend.inc
 +++ b/bsd/dev/fuxi_gpu_abi_backend.inc
-@@ -0,0 +1,1401 @@
+@@ -0,0 +1,1408 @@
 +/* Built into fuxi_adreno.c, with access to its proven SMMU/ring helpers.
 + * Single privileged diagnostic client, not a security boundary for PM4.
 + * Its root has no scanout or surface-cache mappings. The kernel-only runtime
@@ -4880,6 +4880,11 @@
 +static unsigned fg_abi_stage, fg_abi_stall_lines;
 +/* Kernel mapping of every mapped range (diagnostics only: the words under a stalled IB), and the map sequence of each. */
 +static struct { uint64_t iova, bytes; uintptr_t source; uint32_t seq; } fg_abi_maps[FG_ABI_MAX_BOS];
++_Static_assert(FG_ABI_MAX_BOS >= FG_ABI_MAX_IMPORTS, "a client's BO table holds every import");
++/* One past the highest live note, as fg_abi_import_top: fg_abi_map_note takes the lowest free entry and raises it, fg_abi_map_forget
++ * lowers it past empty top entries, both under the GPU lock. The per-unmap search and fg_abi_map_at stop at it (the old code walked
++ * all FG_ABI_MAX_BOS entries at every unmap). */
++static unsigned fg_abi_map_top;
 +static uint32_t fg_abi_map_seq, fg_abi_submit_map_seq;
 +static uint64_t fg_abi_cleaned, fg_abi_skipped, fg_abi_invalidated;
 +/* Per-submit clean volume by class (0 GPU-writable, 1 read-only) and size bucket (<64K, <1M, <16M, more), bytes and ticks, plus the bytes
@@ -5039,17 +5044,19 @@
 + ++fg_abi_map_seq;
 + for (unsigned i=0;i<FG_ABI_MAX_BOS;i++) if (!fg_abi_maps[i].iova) {
 +  fg_abi_maps[i].iova=iova; fg_abi_maps[i].bytes=bytes; fg_abi_maps[i].source=source; fg_abi_maps[i].seq=fg_abi_map_seq;
++  if (i>=fg_abi_map_top) fg_abi_map_top=i+1;
 +  return;
 + }
 +}
 +static void fg_abi_map_forget(uint64_t iova, uint64_t bytes)
 +{
-+ for (unsigned i=0;i<FG_ABI_MAX_BOS;i++) if (fg_abi_maps[i].iova==iova && fg_abi_maps[i].bytes==bytes) fg_abi_maps[i].iova=0;
++ for (unsigned i=0;i<fg_abi_map_top;i++) if (fg_abi_maps[i].iova==iova && fg_abi_maps[i].bytes==bytes) fg_abi_maps[i].iova=0;
++ while (fg_abi_map_top && !fg_abi_maps[fg_abi_map_top-1].iova) fg_abi_map_top--;
 +}
 +/* The mapping that holds a GPU address, or NULL. */
 +static const typeof(fg_abi_maps[0]) *fg_abi_map_at(uint64_t iova)
 +{
-+ for (unsigned i=0;i<FG_ABI_MAX_BOS;i++)
++ for (unsigned i=0;i<fg_abi_map_top;i++)
 +  if (fg_abi_maps[i].iova && iova>=fg_abi_maps[i].iova && iova-fg_abi_maps[i].iova<fg_abi_maps[i].bytes) return &fg_abi_maps[i];
 + return NULL;
 +}
@@ -6937,7 +6944,7 @@
 +#endif
 --- a/bsd/dev/fuxi_abi_wire.h
 +++ b/bsd/dev/fuxi_abi_wire.h
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,167 @@
 +/* SPDX-License-Identifier: MIT
 + * A7xx framing adapted from UniXNU NativeAdrenoRing.cpp.
 + * Copyright (c) 2026 NativeAdreno contributors. See LICENSE.NativeAdreno.
@@ -6950,14 +6957,20 @@
 +#define FG_ABI_PA_BITS 36u /* Fuxi ID2.OAS=1; existing present mapper has the same limit. */
 +#define FG_ABI_MAX_BYTES (UINT64_C(1) << 28)
 +/* Internal quotas, independent of the unchanged per-object wire limit. */
-+#define FG_ABI_MAX_BOS 1024u
++/* BOs of one client at once, allocated and imported (the user client's table and handle index), and entries of the backend's map notes
++ * (fg_abi_maps). v-imp4 (YouTube in Safari, FuxiMetal d335af6): backboardd reached the old 1024 with 754 mapped imports and ~270
++ * allocated BOs, BoImport refused at stage 3 and FuxiMetal fell back to the CPU. At 4096 the import table below (2048) is reached first
++ * with up to 2048 allocated BOs beside it. Cost: 184 bytes a slot per open client (152 the Bo, 32 its two index cells), 736 KiB, and
++ * 32 bytes a map note (128 KiB, static). The user client's per-CPU-map token search and the backend's unmap search stop at the highest
++ * live slot (top_, fg_abi_map_top), so the size costs nothing per call. A power of two (FuxiHandleIndex). Kernel-only. */
++#define FG_ABI_MAX_BOS 4096u
 +#define FG_ABI_MAX_WIRED_BYTES (UINT64_C(768) << 20)
 +/* Mapped host imports at once, in the backend's global table (fg_abi_imports). Each import is also a BO of the one open client, so that
-+ * client's imports stop at FG_ABI_MAX_BOS less its allocated BOs (BoImport stage 3); the rest is room for BOs a closed client left
-+ * quarantined (still mapped until reset). v-yuv1 (YouTube in Safari, FuxiMetal d92d25b, two imports per video frame) held the old 512
-+ * full in eight windows while BoMap refused 1,294 imports, and the same backboardd fell back to 116-169 once the video page went: a
-+ * working set, not a leak. Scans of the table stop at fg_abi_import_top, so the size costs nothing per submit. Kernel-only: no wire
-+ * structure or userland (Turnip, FuxiMetal) is sized by it. */
++ * client's imports stop here or at FG_ABI_MAX_BOS less its allocated BOs (BoImport stage 3), whichever comes first; the rest is room
++ * for BOs a closed client left quarantined (still mapped until reset). v-yuv1 (YouTube in Safari, FuxiMetal d92d25b, two imports per
++ * video frame) held the old 512 full in eight windows while BoMap refused 1,294 imports, and the same backboardd fell back to 116-169
++ * once the video page went: a working set, not a leak. Scans of the table stop at fg_abi_import_top, so the size costs nothing per
++ * submit. Kernel-only: no wire structure or userland (Turnip, FuxiMetal) is sized by it. */
 +#define FG_ABI_MAX_IMPORTS 2048u
 +/* A BO that does not require one physical run asks for one only up to 128 KiB, and not for 5 s after a failed search of its size or
 + * less (UniXNU Adreno740 01ed692, MIT). A search the kernel cannot serve scans every free page first: theirs took 21.7 s over 124
@@ -7379,7 +7392,7 @@
 +#endif
 --- a/iokit/Kernel/arm/fuxi_abi_wire.h
 +++ b/iokit/Kernel/arm/fuxi_abi_wire.h
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,167 @@
 +/* SPDX-License-Identifier: MIT
 + * A7xx framing adapted from UniXNU NativeAdrenoRing.cpp.
 + * Copyright (c) 2026 NativeAdreno contributors. See LICENSE.NativeAdreno.
@@ -7392,14 +7405,20 @@
 +#define FG_ABI_PA_BITS 36u /* Fuxi ID2.OAS=1; existing present mapper has the same limit. */
 +#define FG_ABI_MAX_BYTES (UINT64_C(1) << 28)
 +/* Internal quotas, independent of the unchanged per-object wire limit. */
-+#define FG_ABI_MAX_BOS 1024u
++/* BOs of one client at once, allocated and imported (the user client's table and handle index), and entries of the backend's map notes
++ * (fg_abi_maps). v-imp4 (YouTube in Safari, FuxiMetal d335af6): backboardd reached the old 1024 with 754 mapped imports and ~270
++ * allocated BOs, BoImport refused at stage 3 and FuxiMetal fell back to the CPU. At 4096 the import table below (2048) is reached first
++ * with up to 2048 allocated BOs beside it. Cost: 184 bytes a slot per open client (152 the Bo, 32 its two index cells), 736 KiB, and
++ * 32 bytes a map note (128 KiB, static). The user client's per-CPU-map token search and the backend's unmap search stop at the highest
++ * live slot (top_, fg_abi_map_top), so the size costs nothing per call. A power of two (FuxiHandleIndex). Kernel-only. */
++#define FG_ABI_MAX_BOS 4096u
 +#define FG_ABI_MAX_WIRED_BYTES (UINT64_C(768) << 20)
 +/* Mapped host imports at once, in the backend's global table (fg_abi_imports). Each import is also a BO of the one open client, so that
-+ * client's imports stop at FG_ABI_MAX_BOS less its allocated BOs (BoImport stage 3); the rest is room for BOs a closed client left
-+ * quarantined (still mapped until reset). v-yuv1 (YouTube in Safari, FuxiMetal d92d25b, two imports per video frame) held the old 512
-+ * full in eight windows while BoMap refused 1,294 imports, and the same backboardd fell back to 116-169 once the video page went: a
-+ * working set, not a leak. Scans of the table stop at fg_abi_import_top, so the size costs nothing per submit. Kernel-only: no wire
-+ * structure or userland (Turnip, FuxiMetal) is sized by it. */
++ * client's imports stop here or at FG_ABI_MAX_BOS less its allocated BOs (BoImport stage 3), whichever comes first; the rest is room
++ * for BOs a closed client left quarantined (still mapped until reset). v-yuv1 (YouTube in Safari, FuxiMetal d92d25b, two imports per
++ * video frame) held the old 512 full in eight windows while BoMap refused 1,294 imports, and the same backboardd fell back to 116-169
++ * once the video page went: a working set, not a leak. Scans of the table stop at fg_abi_import_top, so the size costs nothing per
++ * submit. Kernel-only: no wire structure or userland (Turnip, FuxiMetal) is sized by it. */
 +#define FG_ABI_MAX_IMPORTS 2048u
 +/* A BO that does not require one physical run asks for one only up to 128 KiB, and not for 5 s after a failed search of its size or
 + * less (UniXNU Adreno740 01ed692, MIT). A search the kernel cannot serve scans every free page first: theirs took 21.7 s over 124

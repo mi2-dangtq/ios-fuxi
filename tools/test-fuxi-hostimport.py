@@ -183,10 +183,11 @@ int main() {
  undrained=false;assert(!c.drop(b));empty();
  // Exhaust the actual expanded BO table, then close drains every entry.
  c.live_=connected=true;c.lastFence_=0;out={};
- for(unsigned i=0;i<FG_ABI_MAX_BOS;i++)assert(!c.importHost(request,out) && out.handle==c.bos_[i].handle);
- assert(FG_ABI_MAX_BOS>=1024 && c.wired_==FG_ABI_MAX_BOS*32768);
+ /* 4096 imports of 32 KiB: 128 MiB, under the 768 MiB quota, so the table is what refuses (stage 3), as in v-imp4 at the old 1024. */
+ for(unsigned i=0;i<FG_ABI_MAX_BOS;i++)assert(!c.importHost(request,out) && out.handle==c.bos_[i].handle && c.top_==i+1);
+ assert(FG_ABI_MAX_BOS>=4096 && FG_ABI_MAX_BOS>=FG_ABI_MAX_IMPORTS && c.wired_==FG_ABI_MAX_BOS*32768);
  assert(c.importHost(request,out)==kIOReturnNoResources);
- assert(!c.clientClose() && !c.wired_);empty();
+ assert(!c.clientClose() && !c.wired_ && !c.top_ && !c.liveBos_);empty();
  // Three maximum-sized imports cross the old 256 MiB aggregate cap, reach
  // exactly 768 MiB, and share the same quota as ordinary allocation.
  c.live_=true;request.bytes=FG_ABI_MAX_BYTES;
@@ -208,7 +209,7 @@ HANDLE_STUBS = r'''
 #include <cstddef>
 #define IONewZero(T,n) (new (std::nothrow) T[n]())
 #define IODelete(p,T,n) delete[] (p)
-static unsigned peakBos;
+static unsigned peakBos,boTop;
 #include "FuxiHandleIndex.h"
 '''
 

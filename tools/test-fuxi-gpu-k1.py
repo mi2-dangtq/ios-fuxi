@@ -133,14 +133,20 @@ int main() {
  assert(call(c,8,nullptr,&status)==kIOReturnNotOpen && !status.faults && !status.suspends);
  c.live_=true;
  NativeAdrenoAbiBoAlloc alloc{4096,12,0};NativeAdrenoAbiBoAllocReply out{};
- // Allocate 1024 real model-backed objects (16 MiB after 16K rounding).
+ // Allocate every slot: 4096 real model-backed objects (64 MiB after 16K rounding, under the 768 MiB quota); the mark follows.
+ static_assert(FG_ABI_MAX_BOS>=4096,"v-imp4 reached 1024");
  for(unsigned i=0;i<FG_ABI_MAX_BOS;i++) {
   assert(!call(c,2,&alloc,&out) && out.handle);
-  assert(c.bos_[i].handle==out.handle && c.bos_[i].allocated==16384);
+  assert(c.bos_[i].handle==out.handle && c.bos_[i].allocated==16384 && c.top_==i+1 && boTop==i+1);
  }
  assert(c.wired_==FG_ABI_MAX_BOS*16384 && descriptors==FG_ABI_MAX_BOS);
- assert(call(c,2,&alloc,&out)==kIOReturnNoResources && !out.handle);
- NativeAdrenoAbiBoFree release{c.bos_[700].handle};
+ assert(call(c,2,&alloc,&out)==kIOReturnNoResources && !out.handle && c.top_==FG_ABI_MAX_BOS);
+ NativeAdrenoAbiBoFree release{c.bos_[3000].handle};
+ assert(!call(c,4,&release,nullptr) && c.top_==FG_ABI_MAX_BOS);
+ assert(!call(c,2,&alloc,&out) && out.handle==c.bos_[3000].handle);
+ release.handle=c.bos_[FG_ABI_MAX_BOS-1].handle;assert(!call(c,4,&release,nullptr) && c.top_==FG_ABI_MAX_BOS-1 && boTop==FG_ABI_MAX_BOS-1);
+ assert(!call(c,2,&alloc,&out) && out.handle==c.bos_[FG_ABI_MAX_BOS-1].handle && c.top_==FG_ABI_MAX_BOS);
+ release.handle=c.bos_[700].handle;
  assert(!call(c,4,&release,nullptr));
  assert(!call(c,2,&alloc,&out) && out.handle==c.bos_[700].handle);
  NativeAdrenoAbiMetadata meta{};meta.handle=out.handle;meta.bytes=64;
@@ -165,7 +171,7 @@ int main() {
  undo.token++;assert(call(c,14,&undo,nullptr)==kIOReturnBadArgument);undo.token--;
  assert(!call(c,14,&undo,nullptr));
  assert(call(c,14,&undo,nullptr)==kIOReturnBadArgument);
- assert(!c.clientClose() && !c.wired_ && !descriptors && !maps);
+ assert(!c.clientClose() && !c.wired_ && !descriptors && !maps && !c.top_ && !boTop);
  // Rounded allocation shares the wired quota with imported BOs; refusal
  // occurs before allocating backing storage, including corrupt accounting.
  c.live_=true;c.wired_=FG_ABI_MAX_WIRED_BYTES-16384;
@@ -308,7 +314,26 @@ int main() {
   NativeAdrenoAbiBoFree ifr{ih.handle};assert(!call(e,4,&ifr,nullptr) && maps==m0 && completes==c0+1 && descriptors==d0 && outsideN[1][0]==2);
   assert(!e.clientClose() && !e.wired_);
  }
- puts("PASS: actual methods 7/8 dispatch/errors/lengths, 1024 BO allocation/refusal/reuse/close, handle index after churn, 128-IB and legacy 416-byte submit records, shared wired quota, metadata refusal and CPU leases, cached-coherent BOs (device-info flag, gated alloc, WB map attrs, default-cache CPU token), BoAlloc pages before lock_ / BoFree pages after it (alloc and import), contiguous asks up to 128 KiB with a 5 s back-off");
+ // BO table mark (top_): bound() raises it to one past the highest live slot, unbound() lowers it past empty top slots, a new BO takes
+ // the lowest free slot, the CPU-map token search sees only the slots under it, and clientClose still drops (and reports, once) a live
+ // slot at or above it.
+ {
+  Client d;d.live_=true;NativeAdrenoAbiBoAlloc one{16384,12,0};NativeAdrenoAbiBoAllocReply h[10];
+  for(unsigned i=0;i<10;i++) {assert(!call(d,2,&one,&h[i]) && d.find(h[i].handle)==&d.bos_[i] && d.top_==i+1 && boTop==i+1);}
+  NativeAdrenoAbiBoFree rel{h[9].handle};assert(!call(d,4,&rel,nullptr) && d.top_==9);
+  for(unsigned i=5;i<8;i++) {rel.handle=h[i].handle;assert(!call(d,4,&rel,nullptr) && d.top_==9);} /* holes under live slot 8 */
+  rel.handle=h[8].handle;assert(!call(d,4,&rel,nullptr) && d.top_==5 && boTop==5);              /* lowered past the holes */
+  rel.handle=h[0].handle;assert(!call(d,4,&rel,nullptr) && d.top_==5 && d.liveBos_==4);         /* a low hole keeps it */
+  NativeAdrenoAbiBoAllocReply again;assert(!call(d,2,&one,&again) && d.find(again.handle)==&d.bos_[0] && d.top_==5);
+  NativeAdrenoAbiBoCpuMap cm{h[4].handle};NativeAdrenoAbiBoCpuMapReply cv{};assert(!call(d,13,&cm,&cv));
+  IOOptionBits mo=0;IOMemoryDescriptor *mm=nullptr;
+  assert(!d.clientMemoryForType(cv.token,&mo,&mm) && mm);                                          /* slot 4, under the mark */
+  d.top_=4;mm=nullptr;assert(d.clientMemoryForType(cv.token,&mo,&mm)==kIOReturnNotFound && !mm);   /* the search stops at top_ */
+  NativeAdrenoAbiBoCpuUnmap cu{h[4].handle,cv.token,0};assert(!call(d,14,&cu,nullptr));
+  lastLog[0]=0;assert(!d.clientClose() && !d.liveBos_ && !d.wired_ && !d.top_ && !boTop && !d.bos_[4].handle);
+  assert(!strcmp(lastLog,"FUXI GPU ABI: BO slot 4 live above top 4 at close\n"));
+ }
+ puts("PASS: actual methods 7/8 dispatch/errors/lengths, all 4096 BO slots allocation/refusal/reuse/close, BO table mark (raised, lowered past holes, lowest slot reused, CPU-map search bounded, close drops and reports a slot above it), handle index after churn, 128-IB and legacy 416-byte submit records, shared wired quota, metadata refusal and CPU leases, cached-coherent BOs (device-info flag, gated alloc, WB map attrs, default-cache CPU token), BoAlloc pages before lock_ / BoFree pages after it (alloc and import), contiguous asks up to 128 KiB with a 5 s back-off");
 }
 '''
 
@@ -318,14 +343,16 @@ HANDLE_STUBS = r'''
 #include <cstddef>
 #define IONewZero(T,n) (new (std::nothrow) T[n]())
 #define IODelete(p,T,n) delete[] (p)
-static unsigned peakBos;
+static unsigned peakBos,boTop;
 #include "FuxiHandleIndex.h"
 '''
 
 
 def main():
     source = (ROOT/'xnu/fuxi-adreno/FuxiAdrenoUserClient.cpp').read_text()
-    prefix = host.PREFIX.replace('#include <cstdio>', '#include <cstdio>\n#include <cstdlib>').replace('static void cboStat(int,uint64_t){}', '')\
+    prefix = host.PREFIX.replace('#include <cstdio>', '#include <cstdio>\n#include <cstdlib>\n#include <cstdarg>').replace('static void cboStat(int,uint64_t){}', '')\
+        .replace('static void IOLog(const char *,...){}',
+                 'static char lastLog[256];static void IOLog(const char *f,...){va_list a;va_start(a,f);vsnprintf(lastLog,sizeof(lastLog),f,a);va_end(a);}')\
         .replace(' assert(va==0x20000000 && bytes==32768);', ' assert((va==0x20000000 && bytes==32768) || (va>=0x20100000 && va<0x20300000)); /* the latter: cached-BO block */')
     start = prefix.index('struct IOBufferMemoryDescriptor {')
     end = prefix.index('static int fuxi_gpu_abi_unmap', start)

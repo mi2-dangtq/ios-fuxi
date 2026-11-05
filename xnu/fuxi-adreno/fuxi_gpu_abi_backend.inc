@@ -121,6 +121,11 @@ static uint32_t fg_abi_stall_stats[8];
 static unsigned fg_abi_stage, fg_abi_stall_lines;
 /* Kernel mapping of every mapped range (diagnostics only: the words under a stalled IB), and the map sequence of each. */
 static struct { uint64_t iova, bytes; uintptr_t source; uint32_t seq; } fg_abi_maps[FG_ABI_MAX_BOS];
+_Static_assert(FG_ABI_MAX_BOS >= FG_ABI_MAX_IMPORTS, "a client's BO table holds every import");
+/* One past the highest live note, as fg_abi_import_top: fg_abi_map_note takes the lowest free entry and raises it, fg_abi_map_forget
+ * lowers it past empty top entries, both under the GPU lock. The per-unmap search and fg_abi_map_at stop at it (the old code walked
+ * all FG_ABI_MAX_BOS entries at every unmap). */
+static unsigned fg_abi_map_top;
 static uint32_t fg_abi_map_seq, fg_abi_submit_map_seq;
 static uint64_t fg_abi_cleaned, fg_abi_skipped, fg_abi_invalidated;
 /* Per-submit clean volume by class (0 GPU-writable, 1 read-only) and size bucket (<64K, <1M, <16M, more), bytes and ticks, plus the bytes
@@ -280,17 +285,19 @@ static void fg_abi_map_note(uint64_t iova, uint64_t bytes, uintptr_t source)
  ++fg_abi_map_seq;
  for (unsigned i=0;i<FG_ABI_MAX_BOS;i++) if (!fg_abi_maps[i].iova) {
   fg_abi_maps[i].iova=iova; fg_abi_maps[i].bytes=bytes; fg_abi_maps[i].source=source; fg_abi_maps[i].seq=fg_abi_map_seq;
+  if (i>=fg_abi_map_top) fg_abi_map_top=i+1;
   return;
  }
 }
 static void fg_abi_map_forget(uint64_t iova, uint64_t bytes)
 {
- for (unsigned i=0;i<FG_ABI_MAX_BOS;i++) if (fg_abi_maps[i].iova==iova && fg_abi_maps[i].bytes==bytes) fg_abi_maps[i].iova=0;
+ for (unsigned i=0;i<fg_abi_map_top;i++) if (fg_abi_maps[i].iova==iova && fg_abi_maps[i].bytes==bytes) fg_abi_maps[i].iova=0;
+ while (fg_abi_map_top && !fg_abi_maps[fg_abi_map_top-1].iova) fg_abi_map_top--;
 }
 /* The mapping that holds a GPU address, or NULL. */
 static const typeof(fg_abi_maps[0]) *fg_abi_map_at(uint64_t iova)
 {
- for (unsigned i=0;i<FG_ABI_MAX_BOS;i++)
+ for (unsigned i=0;i<fg_abi_map_top;i++)
   if (fg_abi_maps[i].iova && iova>=fg_abi_maps[i].iova && iova-fg_abi_maps[i].iova<fg_abi_maps[i].bytes) return &fg_abi_maps[i];
  return NULL;
 }

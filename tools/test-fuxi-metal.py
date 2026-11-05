@@ -282,7 +282,7 @@ static void seed(void) {
  memset(gmuRegs,0,sizeof(gmuRegs));fenceDrops=fenceStuck=gmuReads=gmuWrites=stallLines=0;
  fg_wptr_fence=fg_abi_unstick=fg_abi_stage=fg_abi_stall_lines=0;memset(fg_wptr_stats,0,sizeof(fg_wptr_stats));
  memset(fg_abi_ibs,0,sizeof(fg_abi_ibs));memset(fg_abi_stall_stats,0,sizeof(fg_abi_stall_stats));
- memset(fg_abi_maps,0,sizeof(fg_abi_maps));fg_abi_map_seq=fg_abi_submit_map_seq=0;
+ memset(fg_abi_maps,0,sizeof(fg_abi_maps));fg_abi_map_seq=fg_abi_submit_map_seq=0;fg_abi_map_top=0;
 }
 static unsigned wait_us(void){unsigned k;return fuxi_gpu_abi_submit_wait_us(&k);}
 static unsigned wakes;static void count_wake(void) {wakes++;}
@@ -504,6 +504,39 @@ int main(void) {
   fg_abi_imports[7].iova=0;}
  assert(!fuxi_gpu_abi_unmap(0x20000000+5*16384,16384) && !fg_abi_imports[0].iova && fg_abi_import_top==0);
  puts("PASS: import scans bounded by the highest live slot, holes, lowest-slot reuse, stats raise a stale mark");
+ // Map notes (fg_abi_maps, FG_ABI_MAX_BOS entries, one per mapped range of a client: v-imp4 reached the old 1024 BOs): 2048 imports
+ // and 2048 owned BOs fill all 4096. The unmap search (fg_abi_map_forget) and fg_abi_map_at stop at fg_abi_map_top, which follows the
+ // highest live note down past holes; a new note takes the lowest free entry; a map past the last note is still mapped, unnoted.
+ reset();
+ assert(!fg_abi_map_top && FG_ABI_MAX_BOS>=4096 && FG_ABI_MAX_BOS>=2*FG_ABI_MAX_IMPORTS);
+ for(unsigned i=0;i<FG_ABI_MAX_BOS;i++) {
+  const uint64_t v=0x20000000+(uint64_t)i*16384;
+  assert(!(i<FG_ABI_MAX_IMPORTS ? fuxi_gpu_abi_map_import(v,source+i*16384,16384,3) : fuxi_gpu_abi_map(v,source+i*16384,16384,3,0,2)));
+  assert(fg_abi_map_top==i+1 && fg_abi_maps[i].iova==v && fg_abi_maps[i].seq==i+1);
+ }
+ assert(fg_abi_import_top==FG_ABI_MAX_IMPORTS);
+ {const uint64_t last=0x20000000+(uint64_t)(FG_ABI_MAX_BOS-1)*16384, extra=last+16384;
+  assert(fg_abi_map_at(last+100)==&fg_abi_maps[FG_ABI_MAX_BOS-1] && fg_abi_map_at(0x20000000)==&fg_abi_maps[0]);
+  assert(!fuxi_gpu_abi_map(extra,source,16384,3,0,2) && *fg_abi_leaf(extra) && !fg_abi_map_at(extra) && fg_abi_map_top==FG_ABI_MAX_BOS);
+  assert(!fuxi_gpu_abi_unmap(extra,16384) && !*fg_abi_leaf(extra) && fg_abi_map_top==FG_ABI_MAX_BOS);
+  assert(!fuxi_gpu_abi_unmap(0x20000000+3000*16384,16384) && !fg_abi_maps[3000].iova && fg_abi_map_top==FG_ABI_MAX_BOS); /* a hole */
+  for(unsigned i=FG_ABI_MAX_BOS-3;i<FG_ABI_MAX_BOS-1;i++)
+   assert(!fuxi_gpu_abi_unmap(0x20000000+(uint64_t)i*16384,16384) && fg_abi_map_top==FG_ABI_MAX_BOS);
+  assert(!fuxi_gpu_abi_unmap(last,16384) && fg_abi_map_top==FG_ABI_MAX_BOS-3 && !fg_abi_map_at(last)); /* past the two holes */
+  assert(!fuxi_gpu_abi_map(last,source,16384,3,0,2) && fg_abi_maps[3000].iova==last && fg_abi_map_top==FG_ABI_MAX_BOS-3);
+  assert(fg_abi_map_at(last)==&fg_abi_maps[3000]);
+  // The searches stop at the mark: a note planted above it is neither found nor cleared.
+  fg_abi_maps[FG_ABI_MAX_BOS-1]=fg_abi_maps[3000];fg_abi_maps[FG_ABI_MAX_BOS-1].iova=0x30000000;
+  assert(!fg_abi_map_at(0x30000000));fg_abi_map_forget(0x30000000,16384);
+  assert(fg_abi_maps[FG_ABI_MAX_BOS-1].iova==0x30000000 && fg_abi_map_top==FG_ABI_MAX_BOS-3);
+  fg_abi_maps[FG_ABI_MAX_BOS-1].iova=0;
+  for(unsigned i=0;i<FG_ABI_MAX_BOS-3;i++) if(i!=3000) {
+   assert(!fuxi_gpu_abi_unmap(0x20000000+(uint64_t)i*16384,16384));
+   assert(fg_abi_map_top==(i+1<FG_ABI_MAX_BOS-3 ? FG_ABI_MAX_BOS-3 : 3001)); /* then note 3000 (last) holds it */
+  }
+  assert(!fuxi_gpu_abi_unmap(last,16384) && !fg_abi_map_top && !fg_abi_import_top);
+  for(unsigned i=0;i<FG_ABI_MAX_BOS;i++) assert(!fg_abi_maps[i].iova);}
+ fprintf(stdout,"PASS: all %u map notes (2048 imports + owned BOs), past-the-end map unnoted, notes bounded by the highest live entry, holes, lowest-entry reuse\n",FG_ABI_MAX_BOS);
  // Indirectly referenced imported BOs must participate, even though the IB
  // itself lives in a different ordinary BO. Watchdog retires without WaitFence.
  reset();

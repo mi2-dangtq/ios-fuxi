@@ -45,6 +45,8 @@ static IOLock *openLock;
 static unsigned peakBos;
 /* Per-call timing for the periodic SWEET FB stats line (fuxi_gpu_abi_stats_log). */
 static IOLock *statLock;
+/* The open client's BO table mark (its top_, written under its lock_): the submit_split line prints it beside live_bos, unlocked. */
+static unsigned boTop;
 static fg_abi_stat stats[FG_ABI_STATS];
 static void abiStat(unsigned slot, uint64_t ticks) {
  if (!statLock) return;
@@ -209,7 +211,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
   uint32_t token, leases, metadataBytes;
   char metadata[64];
  };
- /* 1024 entries no longer fit the 16 KiB OSObject size limit; kept separate. */
+ /* FG_ABI_MAX_BOS entries (152 bytes each) do not fit the 16 KiB OSObject size limit; kept separate. */
  struct BoRange {
   Bo *first, *last;
   Bo *begin() const { return first; } Bo *end() const { return last; }
@@ -220,19 +222,32 @@ class FuxiAdrenoUserClient : public IOUserClient {
  /* handle -> slot (Adreno740 NativeAdrenoHandleIndex, MIT): every selector that names a BO and every IB of a submit looked it up by
   * walking all slots. freeHint_ is the lowest slot that may be free. inBytes_ is the structure input size of the call in flight. */
  FuxiHandleIndex<MaxBos> index_;
- unsigned liveBos_ = 0, freeHint_ = 0, inBytes_ = 0;
+ /* top_ is one past the highest slot that may be live (as the backend's fg_abi_import_top): bound() raises it, unbound() lowers it past
+  * empty top slots, both under lock_. A new BO takes the lowest free slot, so live slots stay packed under it and freeSlot() never
+  * passes it while it is below MaxBos. The token search of clientMemoryForType (every CPU map) and result() walk only up to it;
+  * clientClose still walks the whole table and reports a live slot above it (never expected). */
+ unsigned liveBos_ = 0, freeHint_ = 0, inBytes_ = 0, top_ = 0;
+ BoRange live() const { return {bos_.first,bos_.first+top_}; }
  Bo *freeSlot() {
   for (unsigned i=freeHint_;i<MaxBos;i++) if (!bos_[i].handle) { freeHint_=i; return &bos_[i]; }
   return nullptr;
  }
  void bound(Bo &b) {
-  index_.insert(b.handle,(uint32_t)(&b-bos_.first));
+  const unsigned slot=(unsigned)(&b-bos_.first);
+  index_.insert(b.handle,slot);
   if (++liveBos_>peakBos) peakBos=liveBos_;
+  if (slot>=top_) top_=slot+1;
+  boTop=top_;
  }
+ /* Also clears the handle (drop() then clears the rest), so the top_ walk sees this slot free. */
  void unbound(Bo &b) {
+  const unsigned slot=(unsigned)(&b-bos_.first);
   index_.erase(b.handle);
+  b.handle=0;
   --liveBos_;
-  if ((unsigned)(&b-bos_.first)<freeHint_) freeHint_=(unsigned)(&b-bos_.first);
+  if (slot<freeHint_) freeHint_=slot;
+  while (top_ && !bos_[top_-1].handle) top_--;
+  boTop=top_;
  }
  /* A BO's pages outside lock_ (UniXNU Adreno740 4c75ccb and 14e4a7d, MIT): BoAlloc's are made and wired before it is taken
   * (makePages, made=1 and rc its result; allocate() adopts them), BoFree's are handed out once the GPU no longer maps them and
@@ -256,7 +271,7 @@ class FuxiAdrenoUserClient : public IOUserClient {
  int pid_ = 0;
  void result() {
   if (!diagnostic_ || resultChecked_) return;
-  for (auto &b:bos_) if (b.memory && b.bytes==65536 && b.iova==0x20000000) {
+  for (auto &b:live()) if (b.memory && b.bytes==65536 && b.iova==0x20000000) {
    resultChecked_=true;
    volatile uint32_t *words=(volatile uint32_t *)b.memory->getBytesNoCopy();
    __asm__ volatile("dsb sy" ::: "memory");
@@ -722,7 +737,7 @@ public:
   if (!options || !memory) return kIOReturnBadArgument;
   *memory=nullptr;
   IOLockLock(lock_);
-  if (live_) for (auto &b:bos_) if (b.handle && b.token==token && b.leases) {
+  if (live_) for (auto &b:live()) if (b.handle && b.token==token && b.leases) {
    b.view->retain(); *memory=b.view; *options=kIOMapAnywhere|(b.cached ? kIOMapDefaultCache : kIOMapWriteCombineCache); break;
   }
   IOReturn rc=*memory ? kIOReturnSuccess : kIOReturnNotFound;
@@ -735,7 +750,13 @@ public:
   bool wasLive=live_;
   if (live_) {
    if (lastFence_) (void)wait(lastFence_,200000000);
+   /* The whole table, not live(): a slot live at or above the mark as it was at close (a broken mark: every live slot is below it) is
+    * still dropped, and said once a boot. */
+   static bool aboveSaid;
+   const unsigned top0=top_;
    for (auto &b:bos_) if (b.handle) {
+    const unsigned slot=(unsigned)(&b-bos_.first);
+    if (slot>=top0 && !aboveSaid) { aboveSaid=true; IOLog("FUXI GPU ABI: BO slot %u live above top %u at close\n",slot,top0); }
     /* If drain failed, deliberately keep view, prepare and buffer references
      * until reset. A root daemon crash cannot release pages into live DMA. */
     if (drop(b)!=kIOReturnSuccess) IOLog("FUXI GPU ABI: quarantined BO %llu until reset\n",b.handle);
@@ -836,11 +857,12 @@ static void abiSplitReport(const uint64_t *sum, unsigned n, uint64_t lockMax, co
      t[FG_SPLIT_TOTAL]-t[FG_SPLIT_ARGS]-t[FG_SPLIT_FENCE]-t[FG_SPLIT_LOOKUP]-t[FG_SPLIT_BACKEND]-t[FG_SPLIT_SLEEP] : 0;
  uint64_t ibs=sum[FG_SPLIT_BOS] ? sum[FG_SPLIT_BOS] : 1;
  IOLog("FUXI GPU ABI: submit_split n %u us/submit total %u.%u args %u.%u fence_wait %u.%u lookup %u.%u backend %u.%u retry_sleep %u.%u rest %u.%u"
-     " attempts %u.%u waits %u.%u events %u.%u ibs %u.%u live_bos %u lookup_ns_per_ib %u\n",n,
+     " attempts %u.%u waits %u.%u events %u.%u ibs %u.%u live_bos %u top %u of %u lookup_ns_per_ib %u\n",n,
      T1(t[FG_SPLIT_TOTAL],n),T1(t[FG_SPLIT_ARGS],n),T1(t[FG_SPLIT_FENCE],n),T1(t[FG_SPLIT_LOOKUP],n),T1(t[FG_SPLIT_BACKEND],n),T1(t[FG_SPLIT_SLEEP],n),T1(rest,n),
      (unsigned)(sum[FG_SPLIT_ATT]*10/n)/10,(unsigned)(sum[FG_SPLIT_ATT]*10/n)%10,(unsigned)(sum[FG_SPLIT_WAITS]*10/n)/10,(unsigned)(sum[FG_SPLIT_WAITS]*10/n)%10,
      (unsigned)(sum[FG_SPLIT_EVENTS]*10/n)/10,(unsigned)(sum[FG_SPLIT_EVENTS]*10/n)%10,
-     (unsigned)(sum[FG_SPLIT_BOS]*10/n)/10,(unsigned)(sum[FG_SPLIT_BOS]*10/n)%10,(unsigned)(sum[FG_SPLIT_LIVE]/n),(unsigned)(t[FG_SPLIT_LOOKUP]/ibs));
+     (unsigned)(sum[FG_SPLIT_BOS]*10/n)/10,(unsigned)(sum[FG_SPLIT_BOS]*10/n)%10,(unsigned)(sum[FG_SPLIT_LIVE]/n),
+     __atomic_load_n(&boTop,__ATOMIC_RELAXED),FG_ABI_MAX_BOS,(unsigned)(t[FG_SPLIT_LOOKUP]/ibs));
  fuxi_gpu_abi_submit_split(ns,why,c,&lmax,kib);
  unsigned ok=c[1] ? c[1] : 1, ref=c[0]>c[1] ? c[0]-c[1] : 0;
  IOLog("FUXI GPU ABI: submit_split backend att %u ok %u ref %u (busy/hold/noq/pw/full %u/%u/%u/%u/%u) us/ok idle %u.%u frame %u.%u tlb %u.%u cache %u.%u ring %u.%u bell %u.%u"
@@ -951,7 +973,7 @@ extern "C" void fuxi_gpu_abi_sched_log(void)
  if (!ibs[0]) return;
  uint32_t q[6]; fuxi_gpu_abi_queue_stats(q);
  if (q[0] || q[2] || q[3] || q[4] || q[5]) IOLog("FUXI GPU ABI: queue queued %u deepest %u refused present %u full %u held %u hold_expired %u\n",q[0],q[1],q[2],q[3],q[4],q[5]);
- IOLog("FUXI GPU ABI: submits %u ibs %u max %u over16 %u peak_bos %u wptr writes %u dropped %u repeated %u stuck %u stall kicks %u drains %u acks %u/%u kick_ok %u drain_ok %u snaps %u\n",
-     ibs[0],ibs[1],ibs[2],ibs[3],peakBos,wptr[0],wptr[1],wptr[2],wptr[3],stall[0],stall[2],stall[3],stall[4],stall[5],stall[6],stall[7]);
+ IOLog("FUXI GPU ABI: submits %u ibs %u max %u over16 %u peak_bos %u of %u wptr writes %u dropped %u repeated %u stuck %u stall kicks %u drains %u acks %u/%u kick_ok %u drain_ok %u snaps %u\n",
+     ibs[0],ibs[1],ibs[2],ibs[3],peakBos,FG_ABI_MAX_BOS,wptr[0],wptr[1],wptr[2],wptr[3],stall[0],stall[2],stall[3],stall[4],stall[5],stall[6],stall[7]);
 }
 #endif
