@@ -81,10 +81,10 @@ inline void check(VkResult r,int line=__builtin_LINE()) {
  if(r!=VK_SUCCESS)backboardGate.fault();
  if(r!=VK_SUCCESS) throw std::runtime_error("Vulkan rc "+std::to_string(r)+" at Backend.hpp:"+std::to_string(line)+" (memory objects "+std::to_string(liveMemoryObjects.load())+", "+std::to_string(liveMemoryBytes.load()>>10)+" KiB)");
 }
-// A host-pointer import the caller falls back from (to a shadow copy) is not a GPU failure:
-// throw without latching backboardd onto the CPU.
-inline void importCheck(VkResult r,int line=__builtin_LINE()) {
- if(r!=VK_SUCCESS) throw std::runtime_error("Vulkan rc "+std::to_string(r)+" at Backend.hpp:"+std::to_string(line)+" (host import)");
+// Results that refuse one allocation, mapping or import (FuxiAdreno's BO table, import table or wired quota full; Turnip's own
+// allocation failing): Backend::allocCheck and Backend::importCheck throw KernelRefusal for them, never latching backboardd.
+inline bool allocationRefused(VkResult r){
+ return r==VK_ERROR_OUT_OF_DEVICE_MEMORY || r==VK_ERROR_OUT_OF_HOST_MEMORY || r==VK_ERROR_TOO_MANY_OBJECTS || r==VK_ERROR_INVALID_EXTERNAL_HANDLE || r==VK_ERROR_MEMORY_MAP_FAILED;
 }
 #define FUXI_VK_FUNCTIONS(X) \
  X(CreateQueryPool) X(DestroyQueryPool) X(GetQueryPoolResults) X(CmdResetQueryPool) X(CmdWriteTimestamp) \
@@ -113,6 +113,10 @@ struct Texture : TextureLevels {VkImage image{};VkDeviceMemory memory{};VkImageV
  // hostSource: a sampled IOSurface plane the host import refused, copied by the CPU from these rows (hostRow apart) into the backing
  // buffer when their hash changes (Backend::importHostCopy). surfaceShared: the memory is one import shared by every image of the surface.
  const void *hostSource{};size_t hostRow{};uint64_t hostHash{};bool hostHashed=false,surfaceShared=false;std::array<uint64_t,3> surfaceKey{};
+ // A sampled-only plane imported in place into its surface's shared import (evictable) may have that import evicted while it is idle
+ // (Backend::evictImportsUnlocked: image, view and import freed, the Texture kept for its wrapper); the next submit that uses it
+ // imports it again at importOffset/importRow (Backend::restoreImportUnlocked). lastUse: the submit serial that last used it.
+ bool evictable=false,evicted=false,explicitRow=false;size_t importOffset{},importRow{};uint64_t lastUse=0;
  std::vector<VkImageView> attachmentViews;bool canGenerate=false,filterable=true,blendable=false;uint64_t planStamp=0;};
 struct Sampler {size_t references=1;VkSampler sampler{};uint32_t filters=1;float lodMin=0,lodMax=0;};
 struct VariantKey {
@@ -155,6 +159,21 @@ class Backend {
  void check(VkResult result,int line=__builtin_LINE()) {
   if(result==VK_ERROR_DEVICE_LOST)poisoned=true;
   fuxi::check(result,line);
+ }
+ // A memory object FuxiMetal allocates for itself (AllocateMemory, MapMemory): an allocation-class result refuses that allocation
+ // (KernelRefusal: the caller fails that one object, newTextureWithDescriptor: answers nil); anything else is a device fault.
+ void allocCheck(VkResult result,int line=__builtin_LINE()) {
+  if(result==VK_SUCCESS)return;
+  if(!allocationRefused(result) || poisoned)check(result,line);
+  ++allocationRefusals;
+  throw KernelRefusal("Vulkan rc "+std::to_string(result)+" at Backend.hpp:"+std::to_string(line)+" (memory objects "+std::to_string(liveMemoryObjects.load())+", "+std::to_string(liveMemoryBytes.load()>>10)+" KiB; allocation refused, not a device fault)");
+ }
+ // Any step of a host import (IOSurface, no-copy buffer) the caller falls back from (a copy, a shadow, nil for that texture or
+ // buffer): whatever the result, a refusal of that import, except a lost device, which still latches (check()).
+ void importCheck(VkResult result,int line=__builtin_LINE()) {
+  if(result==VK_SUCCESS)return;
+  if(result==VK_ERROR_DEVICE_LOST || poisoned)check(result,line);
+  throw KernelRefusal("Vulkan rc "+std::to_string(result)+" at Backend.hpp:"+std::to_string(line)+" (host import)");
  }
  void *library{};
  VkInstance instance{}; VkPhysicalDevice physical{}; VkDevice device{}; VkQueue queue{};
@@ -213,10 +232,14 @@ class Backend {
    (unsigned long long)linearOwnRows,(unsigned long long)linearTailUses,(unsigned long long)linearShadows,linearShadowKinds.size(),tailPadBytes>>10,
    (unsigned long long)surfacePassLogs.load(),(unsigned long long)renderTargetLogs.load(),(unsigned long long)(notes?notes():0));
   // IOSurface memory: shared imports live, and the copies made because a host import was refused (cumulative), when there are any.
-  if(!surfaceMemory.empty() || hostCopyTextures || hostImportFailures)
-   fprintf(stderr,"FUXI MTL: cache period surfaces shared_imports=%zu shared_images=%zu host_import_failures=%llu backoff=%d copied_textures=%llu copies=%llu copied_kb=%llu\n",
+  // evicted/restored/restore_refused: idle imports freed, imported again on use, refused then (evictImportsUnlocked); import_retries and
+  // alloc_retries: refusals tried again after evicting; alloc_refused: own allocations refused softly (allocCheck); memory_objects: live
+  // Vulkan memory objects, each one FuxiAdreno BO (the kernel's peak_bos adds Turnip's own).
+  if(!surfaceMemory.empty() || hostCopyTextures || hostImportFailures || importsEvicted || allocationRefusals)
+   fprintf(stderr,"FUXI MTL: cache period surfaces shared_imports=%zu shared_images=%zu host_import_failures=%llu backoff=%d copied_textures=%llu copies=%llu copied_kb=%llu evicted=%llu restored=%llu restore_refused=%llu import_retries=%llu alloc_retries=%llu alloc_refused=%llu memory_objects=%lld\n",
     surfaceMemory.size(),[&]{size_t n=0;for(auto &e:surfaceMemory)n+=e.second.references;return n;}(),(unsigned long long)hostImportFailures,int(importBackoff()),
-    (unsigned long long)hostCopyTextures,(unsigned long long)hostCopies,(unsigned long long)(hostCopyBytes>>10));
+    (unsigned long long)hostCopyTextures,(unsigned long long)hostCopies,(unsigned long long)(hostCopyBytes>>10),
+    (unsigned long long)importsEvicted,(unsigned long long)importsRestored,(unsigned long long)restoreRefusals,(unsigned long long)importRetries,(unsigned long long)allocationRetries,(unsigned long long)allocationRefusals,(long long)liveMemoryObjects.load());
   // The two byte accounts (ResourceLimits): own now/peak this period against its target, imported client memory now/peak against its
   // cap, both under the wired ceiling; cumulative overdrafts (own past the target), refusals at the ceiling, import account refusals,
   // optional refusals and sheds. A gate runtime-failure from the budget needs refused>0 here first.
@@ -498,7 +521,7 @@ public:
  // One host import per IOSurface allocation (identity, base, bytes), shared by every image bound into it (a video frame's two
  // planes, re-wraps under other formats): FuxiAdreno maps at most 512 imports at once (FG_ABI_MAX_IMPORTS), and v-yuv1 filled
  // them with Safari's surfaces while two imports per video frame were live. Under the mutex.
- struct SurfaceMemory {VkDeviceMemory memory{};void *mapped{};size_t bytes{},references{};uint32_t type{};};
+ struct SurfaceMemory {VkDeviceMemory memory{};void *mapped{};size_t bytes{},references{};uint32_t type{};std::vector<Texture *> images;};
  std::map<std::array<uint64_t,3>,SurfaceMemory> surfaceMemory;
  // After a host import fails, sampled surfaces are copied instead of imported until this submit count (importBackoffUntil), and
  // no-copy buffers take their copy at once: a full import table made every frame retry, and fail, for each surface (v-yuv1: 4096).
@@ -507,7 +530,131 @@ public:
  bool importBackoff() const {return importBackoffUntil && submits.load()<importBackoffUntil;}
  void noteImportFailureUnlocked(const char *what,const std::string &why){
   const uint64_t n=++hostImportFailures;importBackoffUntil=submits.load()+importBackoffSubmits;
-  if(logSampled(n))fprintf(stderr,"FUXI MTL: host import refused %s (%s); sampled surfaces are copied for the next %llu submits count=%llu\n",what,why.c_str(),(unsigned long long)importBackoffSubmits,(unsigned long long)n);
+  if(logSampled(n))fprintf(stderr,"FUXI MTL: host import refused %s (%s); this sampled surface and those of the next %llu submits are copied count=%llu\n",what,why.c_str(),(unsigned long long)importBackoffSubmits,(unsigned long long)n);
+ }
+ // Idle import eviction. v-imp4 (5 Nov, YouTube in Safari): every decoded 640x360 frame was a new IOSurface (no import cache hit
+ // while the video played), Core Animation kept both plane textures of each past frame, and FuxiMetal's imports followed exactly
+ // (shared_images = 2 x shared_imports, released with their last image): 733 imports in ~25 s, kernel peak_bos 1024, then a refused
+ // import. An import outliving its use is not freed by its wrapper, so FuxiMetal frees it: a surface whose images are all sampled-only
+ // in-place imports, unused by any submit for evictIdle serials and in no flight, loses its import while more than importKeep are live;
+ // above importHigh live imports or boHigh memory objects (each one FuxiAdreno BO), and before a refused allocation or import is
+ // retried, the least recently used ones go down to importLow/boLow (minIdle serials idle at least). Its textures stay valid and are
+ // imported again by the next submit that uses them (restoreImportUnlocked). Never inside a submit past its restore pass (views and frames are rebuilt).
+ size_t importKeep=256,importHigh=512,importLow=384;int64_t boHigh=640,boLow=512;uint64_t evictIdle=600,evictMinIdle=8,evictEvery=16,evictBatch=64;
+ bool evictInPrepass=false; // submit's restore pass: nothing recorded yet, so eviction is safe there
+ uint64_t allocationRefusals=0,importsEvicted=0,importsRestored=0,restoreRefusals=0,importRetries=0,allocationRetries=0,lastEvictScan=0;
+ bool flightUses(uint64_t lastUse) const {for(auto &s:slots)if(s.busy && s.serial>=lastUse)return true;return false;}
+ void evictSurfaceUnlocked(std::map<std::array<uint64_t,3>,SurfaceMemory>::iterator it){
+  auto s=it->second;surfaceMemory.erase(it);
+  for(auto *t:s.images){
+   clearFrames(t);clearViews(t);
+   for(auto v:t->attachmentViews)if(v){reuseForget(handleKey(v));DestroyImageView(device,v,nullptr);}t->attachmentViews.clear();
+   if(t->view){reuseForget(handleKey(t->view));DestroyImageView(device,t->view,nullptr);}if(t->image)DestroyImage(device,t->image,nullptr);
+   t->view=VK_NULL_HANDLE;t->image=VK_NULL_HANDLE;t->memory=VK_NULL_HANDLE;t->mapped=nullptr;t->surfaceShared=false;t->evicted=true;
+  }
+  frameKernelCall([&]{return UnmapMemory(device,s.memory);});frameKernelCall([&]{FreeMemory(device,s.memory,nullptr);});
+  --liveMemoryObjects;liveMemoryBytes-=s.bytes;limits.releaseImport(s.bytes);++importsEvicted;
+ }
+ // pressure: an allocation or import was just refused; evict up to evictBatch idle imports at once. Returns how many went.
+ size_t evictImportsUnlocked(bool pressure){
+  if((inSubmit && !evictInPrepass) || poisoned || surfaceMemory.empty())return 0;
+  const size_t liveBefore=surfaceMemory.size();const int64_t bosBefore=liveMemoryObjects.load();
+  const bool high=liveBefore>importHigh || bosBefore>boHigh;
+  if(!pressure && !high && (liveBefore<=importKeep || submitSerial-lastEvictScan<evictEvery))return 0;
+  lastEvictScan=submitSerial;
+  std::vector<std::pair<uint64_t,std::array<uint64_t,3>>> idle;
+  for(auto &e:surfaceMemory){
+   if(e.second.images.empty())continue;uint64_t last=0;bool ok=true;
+   for(auto *t:e.second.images){if(!t->evictable){ok=false;break;}last=std::max(last,t->lastUse);}
+   if(!ok || last+evictMinIdle>submitSerial || flightUses(last))continue;
+   idle.push_back({last,e.first});
+  }
+  std::sort(idle.begin(),idle.end());
+  size_t evicted=0;uint64_t oldest=idle.empty()?0:submitSerial-idle.front().first;
+  for(auto &c:idle){
+   const size_t live=surfaceMemory.size();const int64_t bos=liveMemoryObjects.load();
+   const bool go=(pressure && evicted<evictBatch) || (high && (live>importLow || bos>boLow)) || (submitSerial-c.first>=evictIdle && live>importKeep);
+   if(!go)continue;
+   auto it=surfaceMemory.find(c.second);if(it==surfaceMemory.end())continue;
+   evictSurfaceUnlocked(it);++evicted;
+  }
+  if(evicted && logSampled(importsEvicted))fprintf(stderr,"FUXI MTL: imports evicted %zu idle (pressure=%d high=%d) live_imports=%zu->%zu memory_objects=%lld->%lld oldest_idle=%llu submits evicted_total=%llu restored_total=%llu\n",
+   evicted,int(pressure),int(high),liveBefore,surfaceMemory.size(),(long long)bosBefore,(long long)liveMemoryObjects.load(),(unsigned long long)oldest,(unsigned long long)importsEvicted,(unsigned long long)importsRestored);
+  return evicted;
+ }
+ // An evicted texture a submit uses again: its image is made again as at import and bound into the surface's shared import (made
+ // again too unless another plane already brought it back). A refusal leaves it evicted and throws KernelRefusal (soft).
+ void restoreImportUnlocked(Texture *t){
+  VkExternalMemoryImageCreateInfo ei{};ei.sType=VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;ei.handleTypes=VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+  VkSubresourceLayout plane{};plane.rowPitch=t->importRow;
+  VkImageDrmFormatModifierExplicitCreateInfoEXT ex{};ex.sType=VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;ex.drmFormatModifier=0;ex.drmFormatModifierPlaneCount=1;ex.pPlaneLayouts=&plane;
+  if(t->explicitRow)ei.pNext=&ex;
+  VkImageCreateInfo ii{};ii.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;ii.pNext=&ei;ii.imageType=VK_IMAGE_TYPE_2D;ii.format=t->vkFormat;
+  ii.extent={t->width,t->height,1};ii.mipLevels=1;ii.arrayLayers=1;ii.samples=VK_SAMPLE_COUNT_1_BIT;ii.tiling=t->explicitRow?VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT:VK_IMAGE_TILING_LINEAR;
+  ii.usage=t->usage;ii.initialLayout=VK_IMAGE_LAYOUT_PREINITIALIZED;
+  VkImage image{};bool joined=false;
+  try {
+   importCheck(CreateImage(device,&ii,nullptr,&image));VkMemoryRequirements req{};GetImageMemoryRequirements(device,image,&req);
+   auto shared=surfaceMemory.find(t->surfaceKey);
+   if(shared!=surfaceMemory.end() && !(req.memoryTypeBits&(1u<<shared->second.type)))throw KernelRefusal("evicted IOSurface import: shared memory type changed");
+   if(shared==surfaceMemory.end()){
+    void *base=(void *)uintptr_t(t->surfaceKey[1]);const size_t bytes=t->surfaceKey[2];
+    VkMemoryHostPointerPropertiesEXT hp{};hp.sType=VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
+    importCheck(GetMemoryHostPointerPropertiesEXT(device,VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,base,&hp));
+    uint32_t type=0;while(type<memory.memoryTypeCount && (!(req.memoryTypeBits&hp.memoryTypeBits&(1u<<type)) || !(memory.memoryTypes[type].propertyFlags&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)))++type;
+    if(type==memory.memoryTypeCount)throw KernelRefusal("evicted IOSurface import: host memory type mismatch");
+    VkImportMemoryHostPointerInfoEXT hi{};hi.sType=VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;hi.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;hi.pHostPointer=base;
+    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.pNext=&hi;ai.allocationSize=bytes;ai.memoryTypeIndex=type;
+    reserveImportUnlocked(bytes,"surface");VkDeviceMemory imported{};void *mapped=nullptr;
+    auto result=hostImportCall(ai,imported);
+    if(result!=VK_SUCCESS){limits.releaseImport(bytes);importCheck(result);}
+    ++liveMemoryObjects;liveMemoryBytes+=bytes;
+    auto mappedResult=frameKernelCall([&]{return MapMemory(device,imported,0,VK_WHOLE_SIZE,0,&mapped);});
+    if(mappedResult!=VK_SUCCESS){frameKernelCall([&]{FreeMemory(device,imported,nullptr);});--liveMemoryObjects;liveMemoryBytes-=bytes;limits.releaseImport(bytes);importCheck(mappedResult);}
+    shared=surfaceMemory.emplace(t->surfaceKey,SurfaceMemory{imported,mapped,bytes,0,type,{}}).first;
+   }
+   auto &s=shared->second;++s.references;s.images.push_back(t);joined=true;
+   t->memory=s.memory;t->mapped=s.mapped;t->memoryType=s.type;t->borrowedMemory=true;t->surfaceShared=true;t->image=image;
+   importCheck(frameKernelCall([&]{return BindImageMemory(device,image,t->memory,t->importOffset);}));
+   VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=image;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=t->vkFormat;
+   vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};VkImageView view{};importCheck(CreateImageView(device,&vi,nullptr,&view));t->view=view;
+  }catch(...){
+   ++restoreRefusals;
+   if(!poisoned){if(t->view){DestroyImageView(device,t->view,nullptr);t->view=VK_NULL_HANDLE;}if(image)DestroyImage(device,image,nullptr);}
+   t->image=VK_NULL_HANDLE;
+   if(joined){t->surfaceShared=true;releaseSurfaceMemoryUnlocked(t);}
+   t->memory=VK_NULL_HANDLE;t->mapped=nullptr;t->surfaceShared=false;t->evicted=true;
+   throw;
+  }
+  t->evicted=false;t->layout=VK_IMAGE_LAYOUT_PREINITIALIZED;t->levelLayouts={};t->defined=true;++importsRestored;
+ }
+ // Host-pointer AllocateMemory of an IOSurface import; a refusal first evicts idle imports and is tried once more.
+ VkResult hostImportCall(const VkMemoryAllocateInfo &ai,VkDeviceMemory &imported){
+  auto once=[&]{auto result=frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&imported);});
+#ifdef FUXI_MTL_HOST_TEST
+   if(result==VK_SUCCESS && failHostImportsForTest){--failHostImportsForTest;FreeMemory(device,imported,nullptr);imported=VK_NULL_HANDLE;result=hostImportResultForTest;}
+#endif
+   return result;};
+  auto result=once();
+  if(result!=VK_SUCCESS && result!=VK_ERROR_DEVICE_LOST && evictImportsUnlocked(true)){++importRetries;result=once();}
+  if(result==VK_SUCCESS && systemTranslationPolicy().frameTrace)++frameCounts.allocations;
+  return result;
+ }
+ // AllocateMemory of FuxiMetal's own memory: a refusal first frees idle imports (each holds a FuxiAdreno BO) and the idle pools, then
+ // is tried once more; allocCheck turns a second refusal into KernelRefusal.
+ VkResult ownAllocateCall(const VkMemoryAllocateInfo &ai,VkDeviceMemory &out,bool trimInSubmit=false){
+  auto once=[&]{auto result=frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&out);});
+#ifdef FUXI_MTL_HOST_TEST
+   if(result==VK_SUCCESS && failAllocationsForTest){--failAllocationsForTest;FreeMemory(device,out,nullptr);out=VK_NULL_HANDLE;result=VK_ERROR_OUT_OF_DEVICE_MEMORY;}
+#endif
+   return result;};
+  auto result=once();
+  if(allocationRefused(result) && !poisoned){
+   bool freed=evictImportsUnlocked(true)>0;
+   if(!inSubmit || trimInSubmit){const int64_t before=liveMemoryObjects.load();trimMemoryUnlocked(true);freed|=liveMemoryObjects.load()<before;}
+   if(freed){++allocationRetries;result=once();}
+  }
+  return result;
  }
  // Linear textures over buffers (linearTexture): aliased at their own row, aliased only thanks to the tail pad or an import's
  // enclosing pages, shadowed, and the kinds of shadow logged; the live tail pad bytes of owned buffers. Under the mutex.
@@ -517,6 +664,8 @@ public:
  // Test-only reference mode and deterministic recording failure; no production environment switches.
  bool reuseSubmitObjects=true,reuseDrawPlans=true,captureDrawPlans=false,failBeforeQueue=false,failQueueAttempt=false,failAfterChunk=false,failChunkAttempt=false,reuseForgetForTest=true;
  unsigned failHostImportsForTest=0; // the next N surface host imports answer VK_ERROR_OUT_OF_DEVICE_MEMORY, as Turnip did when FuxiAdreno's import table was full
+ VkResult hostImportResultForTest=VK_ERROR_OUT_OF_DEVICE_MEMORY; // what they answer (v-imp4: INVALID_EXTERNAL_HANDLE, the BO table full at stage 3)
+ unsigned failAllocationsForTest=0; // the next N own AllocateMemory calls (buffers, dedicated textures) answer VK_ERROR_OUT_OF_DEVICE_MEMORY (v-imp4: Backend.hpp:754)
  std::vector<std::pair<Pipeline *,DrawOutput>> drawPlansForTest;
  void loseWhileInFlightForTest(){std::lock_guard<std::mutex> lock(mutex);check(VK_ERROR_DEVICE_LOST);}
  struct ImageTransition {Texture *texture;uint32_t level;VkImageLayout before,after;};
@@ -751,8 +900,9 @@ public:
    const size_t tail=linearTail?linearTailPad(ci.size,req.size):0;
    VkMemoryAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;ai.allocationSize=req.size+tail;ai.memoryTypeIndex=type;b->memoryType=type;
    reserveMemoryUnlocked(ai.allocationSize);b->charged=ai.allocationSize;
-   check(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&b->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;tailPadBytes+=tail;check(frameKernelCall([&]{return BindBufferMemory(device,b->buffer,b->memory,0);}));
-   check(frameKernelCall([&]{return MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents);}));b->key=b->contents;memset(b->contents,0,(length+15)&~size_t(15));return b;
+   // A refusal (v-imp4: FuxiAdreno's BO table full under 733 imports) is KernelRefusal, after idle imports were evicted and it was tried again.
+   allocCheck(ownAllocateCall(ai,b->memory));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;tailPadBytes+=tail;check(frameKernelCall([&]{return BindBufferMemory(device,b->buffer,b->memory,0);}));
+   allocCheck(frameKernelCall([&]{return MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents);}));b->key=b->contents;memset(b->contents,0,(length+15)&~size_t(15));return b;
   } catch(...) {destroyUnlocked(b);throw;}
  }
  // NativeMetal's no-copy buffer/linear-image design, using Fuxi HostImport's
@@ -776,7 +926,7 @@ public:
    VkExternalBufferProperties properties{};properties.sType=VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES;GetPhysicalDeviceExternalBufferProperties(physical,&info,&properties);
    auto externalFeatures=properties.externalMemoryProperties.externalMemoryFeatures;
    if(!(externalFeatures&VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) || (externalFeatures&VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) || !(properties.externalMemoryProperties.compatibleHandleTypes&info.handleType))throw std::runtime_error("no-copy buffer external import unavailable");
-   check(CreateBuffer(device,&ci,nullptr,&b->buffer));VkMemoryRequirements req{};GetBufferMemoryRequirements(device,b->buffer,&req);
+   importCheck(CreateBuffer(device,&ci,nullptr,&b->buffer));VkMemoryRequirements req{};GetBufferMemoryRequirements(device,b->buffer,&req);
    if(req.size>bytes)throw std::runtime_error("no-copy buffer allocation size");
    if(!planHostImport(uintptr_t(base),bytes,hostAlignment,req.alignment,maxBufferLength).ok() || plan.offset+req.size>plan.bytes)throw std::runtime_error("no-copy buffer offset alignment "+std::to_string(plan.offset)+" required="+std::to_string(req.alignment));
    VkMemoryHostPointerPropertiesEXT hp{};hp.sType=VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;importCheck(GetMemoryHostPointerPropertiesEXT(device,VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,(void *)plan.base,&hp));
@@ -787,10 +937,12 @@ public:
    // Client pages (destroyUnlocked releases an imported buffer's charge from the import account).
    reserveImportUnlocked(ai.allocationSize,"buffer");b->charged=ai.allocationSize;
 #ifdef FUXI_MTL_HOST_TEST
-   if(failHostImportsForTest){--failHostImportsForTest;importCheck(VK_ERROR_OUT_OF_DEVICE_MEMORY);}
+   if(failHostImportsForTest){--failHostImportsForTest;importCheck(hostImportResultForTest);}
 #endif
-   importCheck(frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&b->memory);}));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;b->allocated=bytes;b->memoryType=type;check(frameKernelCall([&]{return BindBufferMemory(device,b->buffer,b->memory,plan.offset);}));
-   check(frameKernelCall([&]{return MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents);}));b->contents=(uint8_t *)b->contents+plan.offset;return b;
+   {auto result=frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&b->memory);});
+    if(allocationRefused(result) && evictImportsUnlocked(true)){++importRetries;result=frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&b->memory);});}
+    importCheck(result);}if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;b->memoryBytes=ai.allocationSize;b->allocated=bytes;b->memoryType=type;importCheck(frameKernelCall([&]{return BindBufferMemory(device,b->buffer,b->memory,plan.offset);}));
+   importCheck(frameKernelCall([&]{return MapMemory(device,b->memory,0,VK_WHOLE_SIZE,0,&b->contents);}));b->contents=(uint8_t *)b->contents+plan.offset;return b;
   }catch(const std::exception &e){const bool budget=budgetRefusal(e);if(!budget)++HostImportStats::refusedVulkan;destroyUnlocked(b);if(!poisoned && !backboardGate.blocked() && !budget)noteImportFailureUnlocked("buffer",e.what());throw;}
  }
  static std::string linearAliasMismatch(const VkMemoryRequirements &req,const VkSubresourceLayout &layout,uint32_t memoryType,size_t allocated,size_t offset,size_t row,size_t memoryOffset=0) {
@@ -914,8 +1066,8 @@ public:
    else if(t->recyclable && textureMemory.put(t->recycleKey,t->memory,memoryNow()))t->charged=0;
    else {frameKernelCall([&]{return FreeMemory(device,t->memory,nullptr);});--liveMemoryObjects;liveMemoryBytes-=t->memoryBytes;}
   }
-   if(t->surfaceShared)releaseSurfaceMemoryUnlocked(t->surfaceKey); // after its image: the shared import outlives every image bound to it
-  }if(t->imported)limits.releaseImport(t->charged);else limits.release(t->charged);destroyUnlocked(t->backingBuffer);if(!t->backingBuffer)rtForget(t);delete t;return !poisoned;
+   if(t->surfaceShared)releaseSurfaceMemoryUnlocked(t); // after its image: the shared import outlives every image bound to it
+  }else if(t->surfaceShared){auto it=surfaceMemory.find(t->surfaceKey);if(it!=surfaceMemory.end()){auto &v=it->second.images;v.erase(std::remove(v.begin(),v.end(),t),v.end());}}if(t->imported)limits.releaseImport(t->charged);else limits.release(t->charged);destroyUnlocked(t->backingBuffer);if(!t->backingBuffer)rtForget(t);delete t;return !poisoned; // poisoned: the import stays quarantined, but no eviction may see the deleted image
  }
  bool supportsHostImport() const {return hostImport && hostAlignment && GetMemoryHostPointerPropertiesEXT && GetPhysicalDeviceImageFormatProperties2;}
  bool supportsExplicitPitch() const {return supportsHostImport() && explicitPitch;}
@@ -992,18 +1144,18 @@ public:
   if(formatResult==VK_ERROR_FORMAT_NOT_SUPPORTED && vkFormat!=VK_FORMAT_B8G8R8A8_UNORM && (info.usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)){
    info.usage=VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;formatResult=GetPhysicalDeviceImageFormatProperties2(physical,&info,&props);}
   if(formatResult==VK_ERROR_FORMAT_NOT_SUPPORTED)throw std::runtime_error("IOSurface linear external image format unavailable");
-  check(formatResult);
+  importCheck(formatResult);
   auto features=ep.externalMemoryProperties.externalMemoryFeatures;
   if(!(features&VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) || (features&VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) ||
      !(ep.externalMemoryProperties.compatibleHandleTypes&external.handleType) || props.imageFormatProperties.maxExtent.width<width || props.imageFormatProperties.maxExtent.height<height)
    throw std::runtime_error("IOSurface linear sampled/transfer import unsupported");
   auto *t=new Texture{};t->blendable=have&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;t->format=format;t->vkFormat=vkFormat;t->width=width;t->height=height;t->usage=info.usage;t->tiling=VK_IMAGE_TILING_LINEAR;t->imported=true;t->defined=true;t->layout=VK_IMAGE_LAYOUT_PREINITIALIZED;
-  std::string shadowWhy;
+  std::string shadowWhy;bool explicitImage=false;
   try {
    VkExternalMemoryImageCreateInfo ei{};ei.sType=VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;ei.handleTypes=external.handleType;
    VkImageCreateInfo ii{};ii.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;ii.pNext=&ei;ii.imageType=info.type;ii.format=info.format;
    ii.extent={width,height,1};ii.mipLevels=1;ii.arrayLayers=1;ii.samples=VK_SAMPLE_COUNT_1_BIT;ii.tiling=info.tiling;ii.usage=info.usage;ii.initialLayout=t->layout;
-   check(CreateImage(device,&ii,nullptr,&t->image));VkMemoryRequirements req{};GetImageMemoryRequirements(device,t->image,&req);
+   importCheck(CreateImage(device,&ii,nullptr,&t->image));VkMemoryRequirements req{};GetImageMemoryRequirements(device,t->image,&req);
    VkImageSubresource sub{VK_IMAGE_ASPECT_COLOR_BIT,0,0};VkSubresourceLayout layout{};GetImageSubresourceLayout(device,t->image,&sub,&layout);
    // Turnip picks a 256-byte pitch for a plain linear BGRA8 image; Apple's IOSurface rows are 64-byte aligned and the
    // clients that fill them keep the row they asked for (the switcher's decoded snapshot cards, 3 Nov). Then the image is
@@ -1019,7 +1171,7 @@ public:
     auto created=CreateImage(device,&ii,nullptr,&t->image);
     if(created!=VK_SUCCESS){t->image=VK_NULL_HANDLE;char why[96];snprintf(why,sizeof why,"IOSurface explicit row %zu refused rc=%d",row,int(created));
      if(!sampledOnly)throw std::runtime_error(why);shadowWhy=why;}
-    else {GetImageMemoryRequirements(device,t->image,&req);
+    else {GetImageMemoryRequirements(device,t->image,&req);explicitImage=true;
      sub.aspectMask=VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT;GetImageSubresourceLayout(device,t->image,&sub,&layout);
      if(++explicitPitchImports<=16)fprintf(stderr,"FUXI MTL: IOSurface import at its own row %zu (%ux%u; Vulkan linear pitch would differ)\n",row,width,height);}
    }
@@ -1047,24 +1199,25 @@ public:
     // Import/charge the whole surface once, binding each image at its plane's offset. A host import the kernel refuses (FuxiAdreno
     // BoImport or BoMap: Turnip answers VK_ERROR_OUT_OF_DEVICE_MEMORY or INVALID_EXTERNAL_HANDLE) refuses this import only.
     // The surface's pages are the client's: charged to the import account (once per surface), never to the own budget.
+    // A new import: idle ones may go first (evictImportsUnlocked, rate limited), and a refused one is retried once after evicting.
+    evictImportsUnlocked(false);
     reserveImportUnlocked(bytes,"surface");VkDeviceMemory imported{};void *mapped=nullptr;
-    auto result=frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&imported);});
-#ifdef FUXI_MTL_HOST_TEST
-    if(result==VK_SUCCESS && failHostImportsForTest){--failHostImportsForTest;FreeMemory(device,imported,nullptr);imported=VK_NULL_HANDLE;result=VK_ERROR_OUT_OF_DEVICE_MEMORY;}
-#endif
+    auto result=hostImportCall(ai,imported);
     if(result!=VK_SUCCESS){limits.releaseImport(bytes);importCheck(result);}
-    if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=bytes;
+    ++liveMemoryObjects;liveMemoryBytes+=bytes;
     auto mappedResult=frameKernelCall([&]{return MapMemory(device,imported,0,VK_WHOLE_SIZE,0,&mapped);});
-    if(mappedResult!=VK_SUCCESS){frameKernelCall([&]{FreeMemory(device,imported,nullptr);});--liveMemoryObjects;liveMemoryBytes-=bytes;limits.releaseImport(bytes);check(mappedResult);}
-    if(identity)shared=surfaceMemory.emplace(surfaceKey,SurfaceMemory{imported,mapped,bytes,0,type}).first;
+    if(mappedResult!=VK_SUCCESS){frameKernelCall([&]{FreeMemory(device,imported,nullptr);});--liveMemoryObjects;liveMemoryBytes-=bytes;limits.releaseImport(bytes);importCheck(mappedResult);}
+    if(identity)shared=surfaceMemory.emplace(surfaceKey,SurfaceMemory{imported,mapped,bytes,0,type,{}}).first;
     else {t->memory=imported;t->mapped=mapped;t->memoryType=type;t->charged=bytes;t->memoryBytes=bytes;}
    }
-   if(shared!=surfaceMemory.end()){auto &s=shared->second;++s.references;
-    t->memory=s.memory;t->mapped=s.mapped;t->memoryType=s.type;t->borrowedMemory=true;t->surfaceShared=true;t->surfaceKey=surfaceKey;}
+   if(shared!=surfaceMemory.end()){auto &s=shared->second;++s.references;s.images.push_back(t);
+    t->memory=s.memory;t->mapped=s.mapped;t->memoryType=s.type;t->borrowedMemory=true;t->surfaceShared=true;t->surfaceKey=surfaceKey;
+    // Only sampled planes may lose their import while idle (a render target's import must stay what CA renders into).
+    t->evictable=sampledOnly;t->explicitRow=explicitImage;t->importOffset=offset;t->importRow=row;t->lastUse=submitSerial;}
    t->allocated=bytes;
-   check(frameKernelCall([&]{return BindImageMemory(device,t->image,t->memory,offset);}));
+   importCheck(frameKernelCall([&]{return BindImageMemory(device,t->image,t->memory,offset);}));
    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=info.format;
-   vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};check(CreateImageView(device,&vi,nullptr,&t->view));if(identity){t->importKey=key;t->importCached=true;imports.emplace(key,t);}return t;
+   vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};importCheck(CreateImageView(device,&vi,nullptr,&t->view));if(identity){t->importKey=key;t->importCached=true;imports.emplace(key,t);}return t;
   }catch(const std::exception &e) {
    const bool fault=poisoned || backboardGate.blocked();
    // The import account being full is no kernel refusal: no backoff (the next surface may fit, and trying costs no kernel call).
@@ -1075,8 +1228,10 @@ public:
   }
  }
  // A surface's shared import loses an image (destroyTextureUnlocked); the last one unmaps and frees it.
- void releaseSurfaceMemoryUnlocked(const std::array<uint64_t,3> &surfaceKey){
-  auto it=surfaceMemory.find(surfaceKey);if(it==surfaceMemory.end() || --it->second.references)return;
+ void releaseSurfaceMemoryUnlocked(Texture *t){
+  auto it=surfaceMemory.find(t->surfaceKey);if(it==surfaceMemory.end())return;
+  {auto &v=it->second.images;v.erase(std::remove(v.begin(),v.end(),t),v.end());}
+  if(--it->second.references)return;
   auto s=it->second;surfaceMemory.erase(it);
   frameKernelCall([&]{return UnmapMemory(device,s.memory);});frameKernelCall([&]{FreeMemory(device,s.memory,nullptr);});
   --liveMemoryObjects;liveMemoryBytes-=s.bytes;limits.releaseImport(s.bytes);
@@ -1196,9 +1351,8 @@ public:
    else {
     t->recycleKey={ai.allocationSize,memoryType};texturePoolWasted+=ai.allocationSize-req.size;
     reserveMemoryUnlocked(ai.allocationSize);t->charged=ai.allocationSize;
-    auto result=frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&t->memory);});
-    if(result==VK_ERROR_OUT_OF_DEVICE_MEMORY || result==VK_ERROR_OUT_OF_HOST_MEMORY){trimMemoryUnlocked(true);result=frameKernelCall([&]{return AllocateMemory(device,&ai,nullptr,&t->memory);});}
-    check(result);if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;
+    // Refused: idle imports and the pools go, then one more try; still refused, this texture fails alone (KernelRefusal).
+    allocCheck(ownAllocateCall(ai,t->memory,true));if(systemTranslationPolicy().frameTrace)++frameCounts.allocations;++liveMemoryObjects;liveMemoryBytes+=ai.allocationSize;
    }
    t->memoryBytes=ai.allocationSize;check(frameKernelCall([&]{return BindImageMemory(device,t->image,t->memory,0);}));
    VkImageViewCreateInfo vi{};vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;vi.image=t->image;vi.viewType=viewTypeFor(t->textureType);vi.format=ii.format;
@@ -2120,6 +2274,14 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   if(currentFrame)currentFrame->backendLock+=since(submitStart);
   requireLive();
   shedBeforeSubmit();
+  // Every texture this submit uses is marked with the serial it will take (idle eviction reads it); one whose import was evicted
+  // while idle is imported again first. A refusal there fails this submit softly (KernelRefusal), before anything was recorded.
+  // All are marked before any is restored, so the eviction a refused restore runs (nothing recorded yet) spares this submit's own.
+  {const uint64_t mark=submitSerial+1;bool any=false;
+   auto each=[&](auto f){for(const auto &op:ops){f(op.texture);f(op.sourceTexture);for(auto *t:op.samples)f(t);for(unsigned i=0;i<std::min(op.colorCount,8u);++i)f(op.color(i).texture);}};
+   each([&](Texture *t){if(t){t->lastUse=mark;any|=t->evicted;}});
+   if(any){struct Prepass {bool &f;explicit Prepass(bool &x):f(x){f=true;}~Prepass(){f=false;}} prepass(evictInPrepass);
+    each([&](Texture *t){if(t && t->evicted)restoreImportUnlocked(t);});}}
   const bool sequenceLog=systemTranslationPolicy().passTimes && (opSequenceSubmits++%300)==1;
   struct HoldRelease {Backend &b;std::vector<Texture *> held;~HoldRelease(){for(auto *t:held)b.destroyTextureUnlocked(t);}} renameHold{*this,{}};
   const bool rtRenaming=systemTranslationPolicy().rtRename && ops.size()>2;size_t mainBefore=0;

@@ -70,6 +70,7 @@ public:
  explicit Backend(const char * ="unknown") {++constructed;}
  Buffer *allocate(size_t n,bool=false) {
   if(!n || n>maxBufferLength)throw std::runtime_error("length");
+  if(modelAllocationRefused)throw KernelRefusal("modeled allocation refused (FuxiAdreno BO table full)");
   limits.reserve(n);auto *b=new Buffer{calloc(1,n),n,n};++live;return b;
  }
  void destroy(Buffer *b) {if(b){limits.release(b->allocated);free(b->contents);delete b;--live;}}
@@ -84,6 +85,9 @@ public:
  Texture *importTexture(void *base,size_t bytes,size_t row,uint32_t width=256,uint32_t height=256,size_t offset=0,uint64_t=0,uint32_t format=80,bool sampledOnly=false) {
   if(!modelHostImport || !base || !limits.rows(width,height,metalTexelBytes(format),row,offset,bytes))throw std::runtime_error("modeled host import bounds");
   importBase=base;importBytes=bytes;importRow=row;importOffset=offset;importFormat=format;importSampledOnly=sampledOnly;
+  // modelKernelRefused: v-imp4 (5 Nov). The import is refused (BO table full, stage 3) and so is the copy's own allocation: production
+  // throws KernelRefusal for both, which must fail this texture alone.
+  if(modelKernelRefused)throw KernelRefusal("modeled host import refused (stage 3); copy: Vulkan rc -2 at Backend.hpp:754 (allocation refused, not a device fault)");
   // modelImportRefused: the host import is refused (v-yuv1: FuxiAdreno's import table full). A sampled texture is then copied by the
   // CPU (production Backend::importHostCopy); any other use is refused.
   if(modelImportRefused && !sampledOnly)throw std::runtime_error("modeled host import refused");
@@ -92,9 +96,9 @@ public:
   auto *t=new Texture{};t->imported=!modelImportRefused;t->format=format;t->width=width;t->height=height;t->allocated=t->charged=bytes;t->defined=true;t->shadow=sampledOnly && (row%64 || offset%64 || modelImportRefused);
   if(modelImportRefused)t->hostSource=(const uint8_t *)base+offset;return t;
  }
- static inline bool modelImportRefused=false;
+ static inline bool modelImportRefused=false,modelKernelRefused=false,modelAllocationRefused=false,modelSubmitRefused=false;
  uint32_t declaredTextures(const Pipeline *p) const {return p?p->textureSlots:0;}
- Buffer *importBuffer(void *,size_t) {throw std::runtime_error("no modeled host buffer import");}
+ Buffer *importBuffer(void *,size_t) {if(modelKernelRefused)throw KernelRefusal("modeled no-copy import refused (host import)");throw std::runtime_error("no modeled host buffer import");}
  Texture *linearTexture(Buffer *b,uint32_t format,uint32_t usage,uint32_t width,uint32_t height,size_t offset,size_t row,bool=false) {
   requireLive();auto pixel=texelBytes(format);
   if(!b || usage!=1 || !limits.linearRows(width,height,pixel,row,offset,b->length))throw std::runtime_error("linear texture descriptor/extent/stride");
@@ -120,6 +124,7 @@ public:
  void destroy(Pipeline *p) {if(p && !--p->references)delete p;}
  bool requiresSampling(const Pipeline *p) const {return p->sampled;}
  void submit(const std::vector<Operation>& ops,const std::function<void()> &scheduled={},std::function<void()> *retirement=nullptr,const std::function<void()> &prepare={},const std::vector<PrepareWrite> * =nullptr,const std::function<void()> & ={}) {
+  if(modelSubmitRefused)throw KernelRefusal("modeled evicted import not restored (host import)");
   if(retirement && beforeSubmit)beforeSubmit();
   if(prepare)prepare();
   if(retirement){auto copy=ops;submit(copy,scheduled);*retirement=[this]{requireLive();};return;}

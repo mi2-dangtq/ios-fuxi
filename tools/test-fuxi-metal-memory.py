@@ -58,6 +58,24 @@ def main():
             assert line in p.stderr,(line,p.stderr)
         assert 'backboardd gate' not in p.stderr and 'host import refused' not in p.stderr,p.stderr
         print(p.stdout,end='')
+        # v-imp4 (5 Nov): import refusals never latch backboardd; idle IOSurface imports are evicted and imported again on use.
+        subprocess.run(common+['-fsanitize=address,undefined','-DFUXI_MTL_HOST_TEST',
+            '-DFUXI_MTL_ICD="'+str(d/'proxy.so')+'"',str(ROOT/'tools/fuxi-metal/ImportSafeTests.cpp'),
+            '-ldl','-pthread','-o',str(d/'importsafe')],check=True)
+        env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0',LP_NUM_THREADS='2',SOFTWARE_ICD=str(args.icd))
+        p=subprocess.run([str(d/'importsafe')],env=env,text=True,capture_output=True,timeout=120)
+        assert p.returncode==0,p.stderr
+        assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr,p.stderr
+        assert 'FUXI MTL: backboardd gate allow armed' in p.stderr,p.stderr
+        for line in ('FUXI MTL: host import refused surface (Vulkan rc -1000072003 at Backend.hpp:',
+                     'FUXI MTL: imports evicted ','FUXI MTL: IOSurface copied, not imported: format=10 332x198 offset=64 row=384'):
+            assert line in p.stderr,(line,p.stderr)
+        assert 'backboardd gate runtime-failure' not in p.stderr,p.stderr
+        print(p.stdout,end='')
+        p=subprocess.run([str(d/'importsafe'),'lost'],env=env,text=True,capture_output=True,timeout=120)
+        assert p.returncode==0,p.stderr
+        assert 'FUXI MTL: backboardd gate runtime-failure' in p.stderr,p.stderr
+        print(p.stdout,end='')
 
 
 if __name__=='__main__':main()

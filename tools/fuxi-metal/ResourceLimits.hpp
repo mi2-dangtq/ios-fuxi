@@ -8,7 +8,14 @@
 namespace fuxi {
 // A refusal by FuxiMetal's own byte accounting: no Vulkan call failed and nothing is latched. The caller may shed and retry, fall
 // back (a copy for an import), or fail that one resource softly (newTextureWithDescriptor: returns nil, Frontend.mm).
-struct BudgetRefusal : std::runtime_error {using std::runtime_error::runtime_error;};
+// SoftRefusal: one resource refused, nothing latched; the frontend answers nil for that object (softRefusal) and keeps the GPU path.
+struct SoftRefusal : std::runtime_error {using std::runtime_error::runtime_error;};
+struct BudgetRefusal : SoftRefusal {using SoftRefusal::SoftRefusal;};
+// A memory object, mapping or host import the driver/kernel refused with an allocation-class result (out of device or host memory,
+// too many objects, an invalid external handle; FuxiAdreno's per-client BO table or import table full, its wired quota): a refusal of
+// that one allocation, not a device fault. v-imp4 (5 Nov): a refused import (BO table full, stage 3) went to the copy path, whose own
+// buffer allocation was refused the same way and latched backboardd onto the CPU through check(). A lost device still latches.
+struct KernelRefusal : SoftRefusal {using SoftRefusal::SoftRefusal;};
 // Two accounts. `used`: memory FuxiMetal allocates itself (textures, buffers, slabs, pools, shadows, copies), aimed at `target`;
 // optional features and the submit headroom are measured against it. `imported`: client memory backboardd only pins and maps (an
 // IOSurface's pages, a no-copy buffer's), bounded apart by `importCap`. Before 5 Nov both were one 256 MiB budget: in v-imp2c

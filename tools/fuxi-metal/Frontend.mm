@@ -1433,6 +1433,11 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
  if(surfaceFrame && !_frameTrace)fuxi::backboardGate.completed(fuxi::Backend::gpuNanos.load()-gpuBefore,
   std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-frameStart).count());
  }
+ catch(const fuxi::SoftRefusal &e) {
+  // One resource refused (an evicted import that could not be imported again, an allocation FuxiAdreno refused): this command
+  // buffer fails alone, as Metal reports an out-of-memory command buffer, and the GPU path stays. A latched gate or lost device still exits.
+  [self submissionRefused:e.what()];
+ }
  catch(const std::exception &e) {
   failureLog("FUXI MTL: submit FAIL %s\n",e.what());_status=MTLCommandBufferStatusError;
   if(!_error)_error=[[NSError alloc] initWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal
@@ -1482,11 +1487,18 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
   }
   prepareCommandShadows(self,_frameTrace?&_flightTrace:nullptr);for(auto &entry:_shadowUses){auto &use=entry.second;_shadows.add(use.buffer->_buffer->shadowKey(),use.buffer->_wrapped,use.ranges);}
   _shadows.capture(_queue->_shadowPool);if(_frameTrace)_flightTrace.snapshotBytes+=_shadows.bytes();
- }catch(const std::exception &e){[self submissionError:e.what()];}
+ }catch(const fuxi::SoftRefusal &e){[self submissionRefused:e.what()];}catch(const std::exception &e){[self submissionError:e.what()];}
  _commitReturn=fuxi::FrameClock::now();
  if(_frameTrace){_flightTrace.snapshot=fuxi::frameNanos(snapshotStart);_flightTrace.commitCall=fuxi::frameNanos(_commitStart);_queue->_traceReturn=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(_commitReturn.time_since_epoch()).count());}
  frontendTime.stop();if(_frameTrace){_frontendTimes.copyTo(_flightTrace);fuxi::drainEncodePhases(_flightTrace);}
  dispatch_group_leave(_commitReady);
+}
+- (void)submissionRefused:(const char *)message {
+ auto *backend=owner(_queue->_device)->backend;
+ if(fuxi::backboardGate.blocked() || !backend || backend->poisoned){[self submissionError:message];return;}
+ char kind[128];snprintf(kind,sizeof kind,"submit %.64s",fuxi::linearShadowKind(message).c_str());
+ softRefusal(kind,"FUXI MTL: submit refused %s (this command buffer only)",message);
+ @synchronized(self){_status=MTLCommandBufferStatusError;if(!_error)_error=[[NSError alloc] initWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorOutOfMemory userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithUTF8String:message]}];}
 }
 - (void)submissionError:(const char *)message {
  failureLog("FUXI MTL: submit FAIL %s\n",message);
@@ -1536,7 +1548,7 @@ static NSString *renderPassText(MTLRenderPassDescriptor *d){
     for(const auto &op:_ops)if(op.pipeline || op.clearOnly)for(unsigned i=0;i<op.colorCount;++i){auto c=op.color(i);if(c.texture==texture && c.store && texture->isDefined(c.level))_surfaceFrame=true;}}
   }
   }
- }catch(const std::exception &e){[self submissionError:e.what()];}
+ }catch(const fuxi::SoftRefusal &e){[self submissionRefused:e.what()];}catch(const std::exception &e){[self submissionError:e.what()];}
  if(_frameTrace){_flightTrace.counts.pipelines+=fuxi::frameCounts.pipelines-before.pipelines;_flightTrace.counts.descriptors+=fuxi::frameCounts.descriptors-before.descriptors;_flightTrace.counts.allocations+=fuxi::frameCounts.allocations-before.allocations;}
  }
  if(!_overlap && _status!=MTLCommandBufferStatusError)_status=MTLCommandBufferStatusCompleted;
@@ -1901,6 +1913,12 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
   static std::atomic<unsigned> refusals{0};unsigned n=refusals.fetch_add(1);
   if(n<12 || !(n&511))fprintf(stderr,"FUXI MTL: no-copy buffer shadowed (%s) len=%lu import attempts=%llu aligned=%llu enclosed=%llu plan_refused=%llu vulkan_refused=%llu\n",e.what(),(unsigned long)length,(unsigned long long)fuxi::HostImportStats::attempts.load(),(unsigned long long)fuxi::HostImportStats::aligned.load(),(unsigned long long)fuxi::HostImportStats::enclosed.load(),(unsigned long long)fuxi::HostImportStats::refusedPlan.load(),(unsigned long long)fuxi::HostImportStats::refusedVulkan.load());
   try {b->_buffer=owner(self)->backend->allocate(length,true);}
+  catch(const fuxi::SoftRefusal &a){
+   // The import and then its copy refused (FuxiAdreno's BO table or wired quota full): this buffer fails alone, as Metal answers nil.
+   if(fuxi::backboardGate.blocked() || owner(self)->backend->poisoned)failureLog("FUXI MTL: no-copy buffer FAIL %s\n",a.what());
+   else {char kind[128];snprintf(kind,sizeof kind,"no-copy buffer %.64s",fuxi::linearShadowKind(a.what()).c_str());
+    softRefusal(kind,"FUXI MTL: no-copy buffer refused len=%lu import=(%s) copy=(%s)",(unsigned long)length,e.what(),a.what());}
+   [b release];return nil;}
   catch(const std::exception &a){failureLog("FUXI MTL: no-copy buffer FAIL %s\n",a.what());[b release];return nil;}
   memcpy(b->_buffer->contents,pointer,length);b->_shadow=YES;
  }
@@ -1952,7 +1970,7 @@ static NSString *surfaceDescriptorText(IOSurfaceRef surface,NSUInteger plane){
  if(!textureDescriptorAccepted(d,owner(self)->backend->maxTextureDimension()))return nil;
  FuxiTexture *t=[FuxiTexture new];t->_descriptorText=[textureDescriptorText(d) copy];t->_cacheMode=d.cpuCacheMode;t->_device=[self retain];t->_usage=d.usage;t->_shared=d.storageMode==MTLStorageModeShared;t->_memoryless=d.storageMode==MTLStorageModeMemoryless;
  try {t->_texture=owner(self)->backend->allocateTexture((uint32_t)d.pixelFormat,(uint32_t)d.usage,(uint32_t)d.width,(uint32_t)d.height,(uint32_t)d.mipmapLevelCount,(uint32_t)d.textureType,(uint32_t)d.depth);}
- catch(const fuxi::BudgetRefusal &e) {
+ catch(const fuxi::SoftRefusal &e) {
   // FuxiMetal's own byte accounting refused it after shedding everything optional and past the overdraft FuxiAdreno could still wire
   // (Backend::reserveMemoryUnlocked): no Vulkan call failed, so this texture fails alone, as a real device answers nil when out of
   // memory. v-imp2c (5 Nov): CA's 284x93 texture refused this way latched backboardd onto the CPU for the rest of the boot.

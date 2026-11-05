@@ -167,6 +167,29 @@ int main() {
     assert(!fuxi::backboardGate.blocked() && backboardExits==0 && failureCount==failures && softRefusalCount==soft+2 && good());
     id second=[budgetDevice newTextureWithDescriptor:small];assert(second);
     [first release];[second release];[budgetDevice release];}
+   // v-imp4 (5 Nov): FuxiAdreno's BO table full under 733 Safari imports. A video plane whose import is refused and whose copy is
+   // refused too (KernelRefusal from both, no Vulkan device fault), a no-copy buffer whose import and copy are refused, and a command
+   // buffer whose evicted import cannot be imported again each fail alone: nil or an error status, the gate stays good, nothing exits.
+   {fuxi::Backend::modelHostImport=true;id kernelDevice=[cls alloc];FuxiOwner *kernelState=[FuxiOwner new];kernelState->backend=new fuxi::Backend;
+    objc_setAssociatedObject(kernelDevice,&ownerKey,kernelState,OBJC_ASSOCIATION_RETAIN_NONATOMIC);[kernelState release];
+    IOSurfaceRef video=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@332,(id)kIOSurfaceHeight:@198,(id)kIOSurfacePixelFormat:@0x34323076,(id)kIOSurfaceAllocSize:@131072,
+     (id)kIOSurfacePlaneInfo:@[@{(id)kIOSurfacePlaneWidth:@332,(id)kIOSurfacePlaneHeight:@198,(id)kIOSurfacePlaneBytesPerElement:@1,(id)kIOSurfacePlaneBytesPerRow:@384,(id)kIOSurfacePlaneOffset:@64,(id)kIOSurfacePlaneSize:@79872},
+      @{(id)kIOSurfacePlaneWidth:@166,(id)kIOSurfacePlaneHeight:@99,(id)kIOSurfacePlaneBytesPerElement:@2,(id)kIOSurfacePlaneBytesPerRow:@384,(id)kIOSurfacePlaneOffset:@79936,(id)kIOSurfacePlaneSize:@39936}]});
+    assert(video);auto failures=failureCount.load();auto soft=softRefusalCount.load();
+    MTLTextureDescriptor *r8=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:332 height:198 mipmapped:NO];r8.usage=MTLTextureUsageShaderRead;r8.storageMode=MTLStorageModeShared;
+    fuxi::Backend::modelKernelRefused=true;
+    assert(![kernelDevice newTextureWithDescriptor:r8 iosurface:video plane:0]);
+    void *page=nullptr;assert(!posix_memalign(&page,16384,16384));fuxi::Backend::modelAllocationRefused=true;
+    assert(![kernelDevice newBufferWithBytesNoCopy:page length:16384 options:MTLResourceStorageModeShared deallocator:nil]);
+    fuxi::Backend::modelAllocationRefused=false;fuxi::Backend::modelKernelRefused=false;
+    assert(!fuxi::backboardGate.blocked() && backboardExits==0 && failureCount==failures && softRefusalCount==soft+2 && good());
+    FuxiQueue *kernelQueue=[FuxiQueue new];kernelQueue->_device=[kernelDevice retain];
+    fuxi::Backend::modelSubmitRefused=true;FuxiCommandBuffer *refused=(FuxiCommandBuffer *)[kernelQueue commandBuffer];[refused commit];fuxi::Backend::modelSubmitRefused=false;
+    assert(refused.status==MTLCommandBufferStatusError && refused.error.code==MTLCommandBufferErrorOutOfMemory);
+    assert(!fuxi::backboardGate.blocked() && backboardExits==0 && failureCount==failures && softRefusalCount==soft+3 && good());
+    // The same plane imports once the kernel takes imports again.
+    FuxiTexture *luma=(FuxiTexture *)[kernelDevice newTextureWithDescriptor:r8 iosurface:video plane:0];assert(luma);
+    [luma release];[kernelQueue release];free(page);CFRelease(video);[kernelDevice release];}
    // Even a failure after qualification and beyond the ordinary log cap latches.
    failureCount=64;failureLog("test failure after good\n");assert(fuxi::backboardGate.blocked());
    // A latched render server exits so launchd respawns it on the CPU path.
